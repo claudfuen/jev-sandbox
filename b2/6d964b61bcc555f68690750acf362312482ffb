@@ -1,0 +1,50 @@
+app/page.tsx
+  s_10969b22d81ab1::t_bfe0de4ea4da33 1,4
+lib/jev/schema.ts
+  s_10969b22d81ab1::t_3e4b952e2996b2 1-85
+lib/sim/engine.ts
+  s_10969b22d81ab1::t_86740e9318b96e 3
+  s_10969b22d81ab1::t_0a77c52c93fbe8 773-775
+  s_10969b22d81ab1::t_e9d4db9a4aaaaa 862,865,870
+  s_10969b22d81ab1::t_2fbb7bb5e83d99 1-2,4-252,254-365,367-373,375-381,383-390,392-398,400-408,410-422,424-430,432-738,741-772,776-861,863-864,866-869,871
+components/sandbox/world-canvas.tsx
+  s_10969b22d81ab1::t_8a5d2adf935c8f 1-5,7-245
+app/api/jev/route.ts
+  s_10969b22d81ab1::t_e4d4b471f03488 1-87
+lib/jev/prompt.ts
+  s_10969b22d81ab1::t_29390cf3f6e22b 1-88
+components/sandbox/use-sandbox.ts
+  s_10969b22d81ab1::t_eafe0efccd50bc 1-122
+components/sandbox/sprites.ts
+  s_10969b22d81ab1::t_839cd792c31cf9 1-479
+lib/sim/personas.ts
+  s_10969b22d81ab1::t_431a7ec9fbc64b 1-44
+components/sandbox/sandbox.tsx
+  s_10969b22d81ab1::t_7a500505487d62 1-362
+lib/sim/clock.ts
+  s_10969b22d81ab1::t_e0bd243396563a 1-47
+lib/jev/gateway-key.ts
+  s_10969b22d81ab1::t_6f08ab76ad3bde 1-44
+lib/sim/geometry.ts
+  s_10969b22d81ab1::t_076a4eb5bacac2 1-90
+lib/sim/map.ts
+  s_10969b22d81ab1::t_e179298cfca190 1-137
+lib/sim/types.ts
+  s_10969b22d81ab1::t_cef36123a03fc4 1-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b26d964b61bcc555f68690750acf362312482ffb",
+  "prompts": {},
+  "sessions": {
+    "s_10969b22d81ab1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0b1f25e-515e-477d-83fb-661b0d8bb6a2",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Claudio Fuentes <imclaudfuen@gmail.com>"
+    }
+  }
+}

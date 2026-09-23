@@ -13,6 +13,8 @@ view, whether they stop to chat.
 The inspector shows every decision's full probability distribution, the villager's mood, and
 the exact text JEV saw.
 
+Live: https://jev-sandbox-rho.vercel.app
+
 ## Run it
 
 ```bash

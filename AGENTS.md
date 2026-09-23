@@ -42,3 +42,14 @@ It is an experiment in authentic decision-making, not a game.
 - AI Gateway key: `AI_GATEWAY_API_KEY` env, else macOS Keychain service
   `AI_GATEWAY_API_KEY`. Never log or commit it. Dev server: `bun run dev --port 3317`.
 - No em dashes or double hyphens in prose.
+
+## Deployment
+
+- Vercel project `fuen-inc/jev-sandbox`, Git-connected: every push to `main` deploys production at
+  https://jev-sandbox-rho.vercel.app (public, so it can be shared).
+- `AI_GATEWAY_API_KEY` (production and preview) is a dedicated AI Gateway key named `jev-sandbox`
+  with a $10 monthly budget and 75/100% alerts, so a shared public link cannot run up spend.
+  Inspect with `vercel ai-gateway api-keys list --scope fuen-inc`.
+- Private Blob store `jev-sandbox-runs` is connected (`BLOB_READ_WRITE_TOKEN` in all environments)
+  for saving and sharing experiment runs.
+- `vercel env pull` refreshes `.env.local` (OIDC token and Blob token). Never commit it.

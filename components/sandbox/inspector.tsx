@@ -304,7 +304,7 @@ export function InspectorPanel({
 /** The village event log, docked under the world. */
 export function VillageLog({ world }: { world: World }) {
   return (
-    <div className="flex h-40 shrink-0 flex-col overflow-hidden rounded-xl border bg-card">
+    <div className="flex h-44 min-w-0 shrink-0 flex-col overflow-hidden rounded-xl border bg-card">
       <div className="flex shrink-0 items-center justify-between border-b px-3 py-1.5">
         <h3 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">Village log</h3>
         <span className="text-xs text-muted-foreground tabular-nums">{world.log.length} events</span>

@@ -13,18 +13,11 @@ import { ReplayCursor, type RunRecord } from "@/lib/sim/session"
 import type { World } from "@/lib/sim/types"
 
 import { InspectorPanel, VillageLog } from "./inspector"
-import { MetricStrip } from "./metric-strip"
+import { MetricsPanel } from "./metric-strip"
 import { WorldCanvas } from "./world-canvas"
 
 const TICKS_PER_SECOND = 4
 const SPEEDS = [1, 4, 16, 64] as const
-
-const STRIPS: { id: string; label: string; format?: (v: number) => string }[] = [
-  { id: "wellbeing", label: "Wellbeing" },
-  { id: "friendship_density", label: "Friendship density", format: (v) => `${Math.round(v * 100)}%` },
-  { id: "acceptance_rate", label: "Chat acceptance", format: (v) => `${Math.round(v * 100)}%` },
-  { id: "declines", label: "Invitations declined (total)" },
-]
 
 export function ReplayViewer({ record }: { record: RunRecord }) {
   const cursor = useMemo(() => new ReplayCursor(record), [record])
@@ -135,22 +128,9 @@ export function ReplayViewer({ record }: { record: RunRecord }) {
             <span className="w-20 shrink-0 text-right text-xs text-muted-foreground tabular-nums">of {cursor.endTick}</span>
           </div>
 
-          <div className="grid shrink-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+          <div className="grid shrink-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
             <VillageLog world={world} />
-            <div className="grid h-40 grid-cols-2 gap-x-4 gap-y-1 rounded-xl border bg-card px-3 py-2">
-              {STRIPS.map((s) => (
-                <MetricStrip
-                  key={s.id}
-                  label={s.label}
-                  metricId={s.id}
-                  samples={record.metrics}
-                  endTick={cursor.endTick}
-                  tick={world.tick}
-                  onSeek={seek}
-                  format={s.format}
-                />
-              ))}
-            </div>
+            <MetricsPanel samples={record.metrics} domainEnd={cursor.endTick} playhead={world.tick} onSeek={seek} />
           </div>
         </section>
 

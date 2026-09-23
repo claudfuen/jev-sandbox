@@ -11,8 +11,11 @@ import { formatClock } from "@/lib/sim/clock"
 import type { ChoiceMode } from "@/lib/sim/types"
 
 import { InspectorPanel, VillageLog } from "./inspector"
+import { MetricsPanel } from "./metric-strip"
 import { CALL_BUDGET_STEP, useSandbox, type Speed } from "./use-sandbox"
 import { WorldCanvas } from "./world-canvas"
+
+const TICKS_PER_DAY = 288
 
 function downloadJson(filename: string, data: unknown) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: "application/json" }))
@@ -127,7 +130,14 @@ export function Sandbox() {
             </div>
           )}
 
-          <VillageLog world={world} />
+          <div className="grid shrink-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
+            <VillageLog world={world} />
+            <MetricsPanel
+              samples={sim.metrics}
+              domainEnd={Math.max(TICKS_PER_DAY, world.tick)}
+              aside={<span className="text-xs text-muted-foreground">live, sampled hourly</span>}
+            />
+          </div>
         </section>
 
         <InspectorPanel world={world} selectedId={selected.id} onSelect={setSelectedId} />

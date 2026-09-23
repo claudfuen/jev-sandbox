@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import type { JevAnswer } from "@/lib/jev/schema"
 import { toWire, type SimRequest } from "@/lib/sim/engine"
+import { sampleMetrics } from "@/lib/sim/metrics"
 import { Session, type RunRecord } from "@/lib/sim/session"
 import type { ChoiceMode, Intervention, World } from "@/lib/sim/types"
 
@@ -130,11 +131,14 @@ export function useSandbox() {
 
   const world = sessionRef.current.world
   const budgetHit = world.stats.calls >= budget
+  // Hourly samples plus a live point for right now, so the charts move every tick.
+  const metrics = [...sessionRef.current.metrics, sampleMetrics(world)]
 
   return {
     worldRef,
     alphaRef,
     world,
+    metrics,
     version,
     running,
     setRunning,

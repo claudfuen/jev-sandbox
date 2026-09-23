@@ -35,9 +35,10 @@ export const DEFAULT_STRIPS: StripSpec[] = [
   { id: "reciprocity", label: "Favours returned", format: pct },
   { id: "meaning", label: "Meaning of the day", format: whole },
   { id: "grudges", label: "Grudges held", format: whole },
-  { id: "stall_price", label: "Stall price", format: whole },
-  { id: "store_food", label: "Food in the store", format: whole },
-  { id: "granary", label: "Granary built", format: pct },
+  { id: "stall_price", label: "Grocery price", format: whole },
+  { id: "attendance", label: "Shift attendance", format: pct },
+  { id: "treasury", label: "Town treasury", format: whole },
+  { id: "bridge", label: "Footbridge built", format: pct },
 ]
 
 /** Turn samples into the plotted series: raw levels, or per-hour deltas of a count. */

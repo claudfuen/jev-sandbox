@@ -101,17 +101,45 @@ export type Project = {
   doneAt: number | null
 }
 
-/** The communal food store at the plaza. */
-export type Store = { pos: Vec; food: number; nextSpoil: number }
+/** The commons: the chapel pantry anyone can give to, meant for those in need. */
+export type Pantry = { buildingId: string; food: number }
 
-/** What a villager's day job actually does in the world. */
-export type CraftKind = "build" | "cook" | "farm" | "forage" | "fish" | "keep_shop" | "shrine" | "stories"
+/** A business open only while its keeper is inside on shift. */
+export type ShopId = "store" | "diner" | "inn"
+export type Shop = {
+  id: ShopId
+  buildingId: string
+  keeperId: string
+  /** What it sells: groceries to carry home, meals eaten there, drinks at the bar. */
+  good: "groceries" | "meal" | "drink"
+  stock: number
+  /** Business money, separate from the keeper's own purse. */
+  till: number
+  price: number
+  /** What the store pays producers per portion (0 = does not buy). */
+  buyPrice: number
+  /** Sales today, for the 6 pm sales tax. */
+  salesToday: number
+}
+
+/** Public money: the county grant comes in, payroll and deliveries go out. */
+export type Town = {
+  treasury: number
+  taxRate: number
+  /** Ticks each person spent working their job today, for 6 pm payroll. */
+  worked: Record<string, number>
+}
+
+/** The Crier's latest edition, posted on the notice board. */
+export type Edition = { number: number; tick: number; author: string; headlines: string[] }
 
 export type Persona = {
   id: string
   name: string
+  surname: string
+  age: number
+  job: JobId | null
   vocation: string
-  craft: CraftKind
   blurb: string
   psyche: Psyche
   colors: { hair: string; skin: string; shirt: string; pants: string }
@@ -184,15 +212,21 @@ export type Intent =
   | { kind: "sleep" }
   | { kind: "approach"; targetId: string; offer: Offer }
   | { kind: "explore"; poiId: string }
-  | { kind: "campfire" }
+  | { kind: "plaza" }
   | { kind: "wander"; target: Vec }
   | { kind: "rest" }
-  | { kind: "work" }
+  | { kind: "work"; effort: "diligent" | "coast" }
   | { kind: "build"; projectId: string }
   | { kind: "gather"; bushId: string }
   | { kind: "deposit" }
-  | { kind: "meal" }
   | { kind: "take_store" }
+  | { kind: "dine" }
+  | { kind: "bar" }
+  | { kind: "treat" }
+  | { kind: "school" }
+  | { kind: "read_board" }
+  | { kind: "cook_home" }
+  | { kind: "stock_home" }
   | { kind: "eat_carry" }
   | { kind: "buy" }
   | { kind: "sell" }
@@ -245,6 +279,10 @@ export type Agent = {
   facing: Dir
   steps: number
   inside: boolean
+  /** The building they are inside, if any. People inside the same building see each other. */
+  insideOf: string | null
+  /** The last Crier edition they have read. */
+  readEdition: number
   needs: Needs
   needCause: Partial<Record<NeedKey, string>>
   /** Food portions carried (berries or fish). */
@@ -319,14 +357,22 @@ export type World = {
   /** Cumulative event counts used by metrics (chats, declines, meals...). */
   counters: Record<string, number>
   tiles: Tile[]
-  houses: House[]
+  buildings: Building[]
   bushes: Bush[]
   pois: Poi[]
   landmarks: Landmark[]
-  campfire: Vec
+  fountain: Vec
+  board: Vec
+  dock: Vec
+  fields: Vec[]
+  /** The footbridge over Willow Creek: the town's shared build. */
   project: Project
-  store: Store
-  stall: Stall
+  pantry: Pantry
+  /** Each household's own food at home, by home building id. */
+  homeFood: Record<string, number>
+  shops: Record<ShopId, Shop>
+  town: Town
+  edition: Edition | null
   debts: Debt[]
   lies: Lie[]
   /** Help given from one villager to another, "from>to" to count, for reciprocity. */

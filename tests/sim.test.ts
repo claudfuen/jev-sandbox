@@ -20,16 +20,25 @@ describe("pixel maps", () => {
 describe("world", () => {
   const world = createWorld()
 
-  test("every agent can reach every POI, the pond, the grove and home", () => {
+  test("every villager can reach every POI from home, and gets the basic options", () => {
     for (const agent of world.agents) {
       for (const poi of world.pois) {
         expect(isWalkable(world.tiles, poi.stand.x, poi.stand.y)).toBe(true)
         expect(findPath(world.tiles, agent.pos, (p) => p.x === poi.stand.x && p.y === poi.stand.y)).not.toBeNull()
       }
       const options = buildOptions(world, agent)
-      for (const id of ["eat", "drink", "sleep", "campfire", "rest", "build", "take_store"]) {
-        expect(options.some((o) => o.id === id)).toBe(true)
-      }
+      for (const id of ["eat", "drink", "sleep", "plaza", "rest"]) expect(options.some((o) => o.id === id)).toBe(true)
+      const child = agent.persona.age < 16
+      expect(options.some((o) => o.id === "take_store")).toBe(!child)
+      expect(options.some((o) => o.id.startsWith("pickpocket_"))).toBe(false)
+    }
+  })
+
+  test("children are never offered adult-only acts", () => {
+    const w = createWorld()
+    for (let t = 0; t < 120; t++) step(w)
+    for (const kid of w.agents.filter((a) => a.persona.age < 16)) {
+      for (const o of buildOptions(w, kid)) expect(o.id).not.toMatch(/^(lie_|lend_|usury_|pickpocket_|take_store|sell|work_|build|price_|demand_)/)
     }
   })
 
@@ -46,14 +55,14 @@ describe("world", () => {
     const reqs = step(w)
     expect(reqs).toHaveLength(w.agents.length)
     for (const r of reqs) expect(r.perception.noticing.length).toBeGreaterThan(0)
-    expect(perceive(w, w.agents[0]).name).toBe("Wren")
+    expect(perceive(w, w.agents[0]).name).toBe("Tomas")
     expect(perceive(w, w.agents[0]).psyche.length).toBeGreaterThan(2)
   })
 
-  test("map is fully bordered", () => {
+  test("map is bordered except the county road exit", () => {
     for (let x = 0; x < MAP_W; x++) {
       expect(isWalkable(world.tiles, x, 0)).toBe(false)
-      expect(isWalkable(world.tiles, x, MAP_H - 1)).toBe(false)
+      if (x !== 24) expect(isWalkable(world.tiles, x, MAP_H - 1)).toBe(false)
     }
   })
 })
@@ -134,7 +143,7 @@ describe("record and replay", () => {
     const cursor = new ReplayCursor(record)
     cursor.seek(1)
     const d = cursor.world.agents[0].decisions.at(-1)!
-    expect(d.state).toContain("You are Wren")
+    expect(d.state).toContain("You are Tomas")
     expect(d.state).toContain("Who you are:")
   })
 })
@@ -150,10 +159,10 @@ describe("psychology", () => {
     expect(mo).toContain("caring for the people close to you")
   })
 
-  test("everyone has a house and there are ten founders", () => {
+  test("everyone has a home and there are fifteen founders", () => {
     const w = createWorld()
-    expect(w.agents).toHaveLength(10)
-    for (const a of w.agents) expect(w.houses.some((h) => h.residents.includes(a.id))).toBe(true)
+    expect(w.agents).toHaveLength(15)
+    for (const a of w.agents) expect(w.buildings.some((b) => b.residents.includes(a.id))).toBe(true)
   })
 })
 
@@ -179,7 +188,7 @@ describe("economy and moral actions", () => {
       for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
     }
     const c = session.world.counters
-    const touched = ["purchases", "gifts", "compliments", "loans", "pickpockets_caught", "pickpockets_unseen", "lies_told"].filter((k) => (c[k] ?? 0) > 0)
+    const touched = ["purchases", "gifts", "compliments", "loans", "pickpockets_caught", "pickpockets_unseen", "lies_told", "meals_served", "work_sessions"].filter((k) => (c[k] ?? 0) > 0)
     expect(touched.length).toBeGreaterThanOrEqual(4)
     const record = session.toRecord({ id: "econ-run", title: "t", createdAt: "2026-01-01T00:00:00Z", source: "lab" })
     const cursor = new ReplayCursor(record)
@@ -191,10 +200,14 @@ describe("economy and moral actions", () => {
 
   test("coins are conserved across trade, gifts, loans and theft", () => {
     const session = new Session({ seed: 12 })
-    const total = (w: typeof session.world) => w.agents.reduce((n, a) => n + a.coins, 0) + w.stall.coins
-    const before = total(session.world)
+    const w0 = session.world
+    const total = (w: typeof w0) =>
+      w.agents.reduce((n, a) => n + a.coins, 0) + Object.values(w.shops).reduce((n, s) => n + s.till, 0) + w.town.treasury
+    const before = total(w0)
     for (let t = 0; t < 600; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
-    expect(total(session.world)).toBe(before)
+    // Coins only cross the town boundary as the county grant (in) and deliveries (out).
+    const boundary = (w0.counters.coins_in ?? 0) - (w0.counters.coins_out ?? 0)
+    expect(total(session.world)).toBe(before + boundary)
   })
 
   test("personality drifts, within the daily cap, under both drift models", () => {
@@ -222,5 +235,18 @@ describe("reflection", () => {
     const session = new Session({ seed: 22, driftModel: "off" })
     for (let t = 0; t < 700; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
     expect(session.world.agents.every((a) => a.drift.length === 0)).toBe(true)
+  })
+})
+
+describe("town", () => {
+  test("shops open only while their keeper is inside on shift, and payroll follows hours worked", () => {
+    const session = new Session({ seed: 31 })
+    for (let t = 0; t < 300; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+    const c = session.world.counters
+    expect(c.work_sessions ?? 0).toBeGreaterThan(0)
+    // Nobody was ever served while the keeper was away.
+    expect((c.meals_served ?? 0) + (c.drinks_served ?? 0) + (c.purchases ?? 0) + (c.found_closed ?? 0)).toBeGreaterThan(0)
+    expect((c.shift_ticks_due ?? 0) > 0).toBe(true)
+    expect(c.coins_in ?? 0).toBeGreaterThan(0)
   })
 })

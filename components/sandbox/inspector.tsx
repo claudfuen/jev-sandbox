@@ -9,6 +9,7 @@ import { NEED_NAMES, needWord } from "@/lib/jev/prompt"
 import { GOALS, MOOD_LEVELS, MOTIVES, NEED_KEYS, type NeedKey } from "@/lib/jev/schema"
 import { formatTime } from "@/lib/sim/clock"
 import { describeLocation, describeStatus } from "@/lib/sim/engine"
+import { JOBS, shiftPhrase } from "@/lib/sim/jobs"
 import { FOUNDATION_KEYS, psycheLines, VALUE_KEYS } from "@/lib/sim/psyche"
 import type { Agent, Persona, World } from "@/lib/sim/types"
 
@@ -75,7 +76,9 @@ function AgentHeader({ agent, world }: { world: World; agent: Agent }) {
         <div className="flex min-w-0 flex-col gap-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold">{agent.persona.name}</h2>
-            <span className="text-xs text-muted-foreground">{agent.persona.vocation}</span>
+            <span className="text-xs text-muted-foreground">
+              {agent.persona.vocation}, {agent.persona.age}
+            </span>
             {agent.mood && <Badge variant="secondary">feeling {agent.mood.label}</Badge>}
             <Badge variant="outline">{agent.coins} coins</Badge>
             {agent.carry > 0 && <Badge variant="outline">carrying {agent.carry} food</Badge>}
@@ -86,7 +89,13 @@ function AgentHeader({ agent, world }: { world: World; agent: Agent }) {
       <div className="rounded-lg border bg-muted/40 px-3 py-2 text-sm">
         <span className="font-medium">Now: </span>
         {describeStatus(world, agent)}
-        <span className="text-muted-foreground">, {describeLocation(world, agent)}</span>
+        {!agent.insideOf && <span className="text-muted-foreground">, {describeLocation(world, agent)}</span>}
+        {agent.persona.job && (
+          <div className="mt-1 text-xs text-muted-foreground">
+            {JOBS[agent.persona.job].title}, {shiftPhrase(JOBS[agent.persona.job])}
+            {JOBS[agent.persona.job].pay ? `, paid ${JOBS[agent.persona.job].pay} coins a day` : ", self-employed"}
+          </div>
+        )}
       </div>
     </div>
   )

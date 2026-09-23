@@ -31,6 +31,17 @@ It is an experiment in authentic decision-making, not a game.
 
 ## Society systems (increments shipped so far)
 
+- The world is Fernhollow (`lib/sim/town-map.ts`, spec 2.1 to 2.5): a 48x30 town with 15 founders
+  (`lib/sim/personas.ts`), homes, a clinic, police station, town hall, school, chapel, general store,
+  diner, inn, print shop and workshop. `lib/sim/map.ts` is the facade everything imports.
+- Jobs (`lib/sim/jobs.ts`): posted shifts and pay. Nobody is forced to work: each hour a job holder
+  chooses to work diligently, coast or do something else. Shops, the clinic and the school are open
+  only while their keeper is inside on shift, so a no-show is perceptible. Payroll at 6 pm is pro
+  rata by hours worked; the county grant and deliveries at 7 am are the only coins crossing the town
+  boundary (tested). Households have home pantries; the chapel pantry is the commons.
+- The footbridge is the shared build; the Crier (the journalist's edition on the notice board) is
+  how news spreads beyond eyewitnesses.
+
 - `lib/sim/psyche.ts`: per-villager psychology rendered into words (`psycheLines`, versioned).
   Psychology shapes need drain rates and how consequences feel, never option ranking.
 - `lib/sim/drift.ts`: personality drift from habit (what you keep choosing) and experience (being

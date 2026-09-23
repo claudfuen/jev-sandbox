@@ -9,26 +9,32 @@ import { MAP_H, MAP_W, TILE, tileAt } from "@/lib/sim/map"
 import type { Agent, World } from "@/lib/sim/types"
 
 import {
+  drawBoard,
+  drawBridge,
+  drawBridgeLot,
   drawBubble,
+  drawBuilding,
   drawBush,
-  drawCampfire,
   drawCarry,
   drawCharacter,
+  drawChild,
+  drawDock,
+  drawFence,
+  drawField,
   drawFlowers,
-  drawGranary,
-  drawGranarySite,
+  drawFord,
+  drawFountain,
   drawGrass,
-  drawHouse,
+  drawGrave,
+  drawLot,
   drawPath,
   drawRock,
   drawSand,
+  drawScaffold,
   drawSign,
-  drawStall,
-  drawStoreBasket,
   drawTallGrass,
   drawTree,
   drawWater,
-  drawWell,
   PAL,
   type EmoteKind,
 } from "./sprites"
@@ -38,7 +44,7 @@ const SCALE = 1
 const W = MAP_W * TILE
 const H = MAP_H * TILE
 
-/** Everything that never changes, painted once. */
+/** Everything that never changes, painted once. Animated tiles and buildings are drawn per frame. */
 function paintStatic(world: World): HTMLCanvasElement {
   const canvas = document.createElement("canvas")
   canvas.width = W * SCALE
@@ -50,6 +56,7 @@ function paintStatic(world: World): HTMLCanvasElement {
     for (let tx = 0; tx < MAP_W; tx++) {
       const px = tx * TILE
       const py = ty * TILE
+      const same = (dx: number, dy: number) => tileAt(world.tiles, tx + dx, ty + dy) === tileAt(world.tiles, tx, ty)
       switch (tileAt(world.tiles, tx, ty)) {
         case "tallgrass":
           drawTallGrass(ctx, px, py)
@@ -59,6 +66,8 @@ function paintStatic(world: World): HTMLCanvasElement {
           break
         case "path":
         case "door":
+        case "building":
+        case "house":
           drawPath(ctx, px, py, tx, ty)
           break
         case "sand":
@@ -75,19 +84,34 @@ function paintStatic(world: World): HTMLCanvasElement {
           drawGrass(ctx, px, py, tx, ty)
           drawSign(ctx, px, py)
           break
-        case "well":
-          drawPath(ctx, px, py, tx, ty)
-          drawWell(ctx, px, py)
+        case "field":
+          drawField(ctx, px, py, tx, ty)
           break
-        case "campfire":
-        case "store":
-        case "stall":
+        case "board":
           drawPath(ctx, px, py, tx, ty)
+          drawBoard(ctx, px, py)
           break
-        case "site":
+        case "dock":
+          drawDock(ctx, px, py)
+          break
+        case "grave":
           drawGrass(ctx, px, py, tx, ty)
+          drawGrave(ctx, px, py)
+          break
+        case "fence":
+          drawGrass(ctx, px, py, tx, ty)
+          drawFence(ctx, px, py, tx, ty)
+          break
+        case "lot":
+          drawLot(ctx, px, py, tx, ty, { top: !same(0, -1), right: !same(1, 0), bottom: !same(0, 1), left: !same(-1, 0) })
           break
         case "water":
+        case "fountain":
+        case "ford":
+        case "bridge_lot":
+        case "scaffold":
+        case "bridge":
+        case "bush":
           break
         default:
           drawGrass(ctx, px, py, tx, ty)
@@ -95,6 +119,21 @@ function paintStatic(world: World): HTMLCanvasElement {
     }
   }
   return canvas
+}
+
+const JOB_EMOTE: Partial<Record<string, EmoteKind>> = {
+  police_officer: "badge",
+  doctor: "cross",
+  nurse: "cross",
+  teacher: "book",
+  journalist: "paper",
+  innkeeper: "beer",
+  mayor: "bell",
+  shopkeeper: "coin",
+  cook: "berry",
+  farmer: "hammer",
+  fisher: "drop",
+  carpenter: "hammer",
 }
 
 function emoteFor(world: World, agent: Agent, t: number): EmoteKind | null {
@@ -111,24 +150,27 @@ function emoteFor(world: World, agent: Agent, t: number): EmoteKind | null {
       return Math.floor(t / 600) % 2 ? "note" : "heart"
     case "collapsed":
       return "sad"
+    case "moving":
+      return s.intent.kind === "work" && agent.persona.job === "police_officer" ? "badge" : null
     case "acting":
       switch (s.intent.kind) {
         case "work":
-          return agent.persona.craft === "stories" ? "note" : "hammer"
+          return JOB_EMOTE[agent.persona.job ?? ""] ?? "hammer"
         case "build":
           return "hammer"
         case "deposit":
           return "gift"
-        case "meal":
-          return "berry"
         case "eat":
+        case "gather":
           return "berry"
         case "drink":
           return "drop"
         case "explore":
           return "sparkle"
-        case "campfire":
-          return "fire"
+        case "plaza":
+          return "note"
+        case "read_board":
+          return "paper"
         default:
           return null
       }
@@ -236,25 +278,38 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
       ctx.imageSmoothingEnabled = false
       ctx.drawImage(staticLayer!, 0, 0, W, H)
 
-      // Animated tiles.
+      // Animated tiles and the footbridge.
+      const progress = world.project.sessionsDone / world.project.sessionsNeeded
       for (let ty = 0; ty < MAP_H; ty++) {
         for (let tx = 0; tx < MAP_W; tx++) {
           const tile = tileAt(world.tiles, tx, ty)
-          if (tile === "water") drawWater(ctx, tx * TILE, ty * TILE, tx, ty, t)
-          else if (tile === "campfire") drawCampfire(ctx, tx * TILE, ty * TILE, t)
+          const px = tx * TILE
+          const py = ty * TILE
+          if (tile === "water") drawWater(ctx, px, py, tx, ty, t)
+          else if (tile === "fountain") {
+            drawPath(ctx, px, py, tx, ty)
+            drawFountain(ctx, px, py, t)
+          } else if (tile === "ford") drawFord(ctx, px, py, tx, ty, t)
+          else if (tile === "bridge_lot" || tile === "scaffold") {
+            if (progress > 0) {
+              drawWater(ctx, px, py, tx, ty, t)
+              drawScaffold(ctx, px, py, progress)
+            } else drawBridgeLot(ctx, px, py, t)
+          } else if (tile === "bridge") {
+            drawWater(ctx, px, py, tx, ty, t)
+            drawBridge(ctx, px, py)
+          }
         }
       }
-      for (const bush of world.bushes) drawBush(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.berries)
-      const { project, store } = world
-      if (project.doneAt !== null) drawGranary(ctx, project.pos.x * TILE, project.pos.y * TILE)
-      else drawGranarySite(ctx, project.pos.x * TILE, project.pos.y * TILE, project.sessionsDone / project.sessionsNeeded)
-      drawStoreBasket(ctx, store.pos.x * TILE, store.pos.y * TILE, store.food)
-      drawStall(ctx, world.stall.pos.x * TILE, world.stall.pos.y * TILE, world.stall.food, world.stall.price)
+      for (const bush of world.bushes) {
+        drawGrass(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.pos.x, bush.pos.y)
+        drawBush(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.berries)
+      }
 
       const night = darkness(world.tick)
-      for (const house of world.houses) {
-        const lit = world.agents.some((a) => a.inside && house.residents.includes(a.id))
-        drawHouse(ctx, house.x * TILE, house.y * TILE, lit, night)
+      for (const b of world.buildings) {
+        const lit = world.agents.some((a) => a.insideOf === b.id)
+        drawBuilding(ctx, b, lit, night)
       }
 
       for (const { a, x, y, moving } of drawn) {
@@ -264,7 +319,8 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
           ctx.fillRect(x + 1, y + 16, 14, 1)
         }
         const walkFrame = moving && alpha < 0.85 ? ((a.steps % 2) as 0 | 1) : null
-        drawCharacter(ctx, a.persona, x, y, a.facing, walkFrame)
+        if (a.persona.age < 16) drawChild(ctx, a.persona, x, y, a.facing, walkFrame)
+        else drawCharacter(ctx, a.persona, x, y, a.facing, walkFrame)
         if (a.carry > 0 && a.status.kind !== "collapsed") drawCarry(ctx, x + 11, y + 9, a.carry)
       }
 
@@ -272,13 +328,16 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
       if (night > 0) {
         ctx.fillStyle = `rgba(18, 26, 74, ${night})`
         ctx.fillRect(0, 0, W, H)
-        const fx = world.campfire.x * TILE + 8
-        const fy = world.campfire.y * TILE + 8
-        const glow = ctx.createRadialGradient(fx, fy, 2, fx, fy, 44)
-        glow.addColorStop(0, `rgba(255, 190, 90, ${night * 0.9})`)
-        glow.addColorStop(1, "rgba(255, 190, 90, 0)")
-        ctx.fillStyle = glow
-        ctx.fillRect(fx - 44, fy - 44, 88, 88)
+        const inn = world.buildings.find((b) => b.kind === "inn")
+        for (const lamp of [world.fountain, ...(inn ? [inn.door] : [])]) {
+          const fx = lamp.x * TILE + 8
+          const fy = lamp.y * TILE + 8
+          const glow = ctx.createRadialGradient(fx, fy, 2, fx, fy, 40)
+          glow.addColorStop(0, `rgba(255, 200, 110, ${night * 0.8})`)
+          glow.addColorStop(1, "rgba(255, 200, 110, 0)")
+          ctx.fillStyle = glow
+          ctx.fillRect(fx - 40, fy - 40, 80, 80)
+        }
       }
 
       // Bubbles scale with the world; name tags stay a constant, readable size.

@@ -45,12 +45,21 @@ export async function runJev(input: JevRequest, signal?: AbortSignal): Promise<J
   ensureGatewayKey()
   const { state, questions } = buildJevCall(req)
   const started = Date.now()
-  const result = await evaluate({
-    model: JEV_MODEL,
-    state,
-    questions,
-    abortSignal: signal ?? AbortSignal.timeout(TIMEOUT_MS),
-  })
+  const ask = () =>
+    evaluate({
+      model: JEV_MODEL,
+      state,
+      questions,
+      abortSignal: signal ?? AbortSignal.timeout(TIMEOUT_MS),
+    })
+  let result: Awaited<ReturnType<typeof ask>>
+  try {
+    result = await ask()
+  } catch (error) {
+    // Rounded probabilities can tie, and the SDK then rejects the answer. One retry clears it.
+    if (!/highest-probability/i.test((error as Error).message)) throw error
+    result = await ask()
+  }
   const answers = Object.fromEntries(
     Object.entries(result.answers).map(([id, a]) => [id, normalize(a as SdkAnswer)]),
   )

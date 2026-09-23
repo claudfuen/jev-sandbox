@@ -1,0 +1,19 @@
+components/sandbox/use-sandbox.ts
+  s_10969b22d81ab1::t_e1b034fd9fefef 12-16,19-26,28-33,36-37,52-56,58-59,61-70,84-111,114-115,120-186,188-189,191-198,201-219,221-223,225-234,236-256,258,261-269,273-275,277-310,316,318-332,334-360,362,365-378,400-401,403,405,407,409
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "2db20e2cd52b5dcd20e541bcbb1d7c0a77d84b42",
+  "prompts": {},
+  "sessions": {
+    "s_10969b22d81ab1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0b1f25e-515e-477d-83fb-661b0d8bb6a2",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Claudio Fuentes <imclaudfuen@gmail.com>"
+    }
+  }
+}

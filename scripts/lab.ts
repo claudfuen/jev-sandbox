@@ -38,6 +38,7 @@ const experiment = flag("experiment", "lab")!.toLowerCase().replace(/[^a-z0-9-]/
 const condition = flag("condition", "baseline")!
 const upload = flag("upload") === "true"
 const assess = flag("assess") === "true"
+const driftModel = (flag("drift", "jev") as "jev" | "engine" | "off") ?? "jev"
 const verbose = flag("verbose") === "true"
 const interventions: { tick: number; intervention: Intervention }[] = (flag("intervene") ?? "")
   .split(",")
@@ -65,7 +66,7 @@ type Outcome = { ok: true; ans: Awaited<ReturnType<typeof runJev>> } | { ok: fal
 
 async function runWorld(index: number): Promise<RunRecord> {
   const seed = baseSeed + index
-  const session = new Session({ seed })
+  const session = new Session({ seed, driftModel })
   const { world } = session
   const outcomes = new Map<number, Promise<Outcome>>()
   const endTick = days * TICKS_PER_DAY
@@ -130,7 +131,7 @@ async function runWorld(index: number): Promise<RunRecord> {
 
 const started = Date.now()
 console.log(
-  `lab: ${worlds} world(s) x ${days} day(s), think=${think}, mode=${mode}, concurrency=${concurrency}${interventions.length ? `, interventions=${interventions.map((i) => `${i.intervention.kind}@${i.tick}`).join(",")}` : ""}`,
+  `lab: ${worlds} world(s) x ${days} day(s), drift=${driftModel}, think=${think}, mode=${mode}, concurrency=${concurrency}${interventions.length ? `, interventions=${interventions.map((i) => `${i.intervention.kind}@${i.tick}`).join(",")}` : ""}`,
 )
 const records = await Promise.all(Array.from({ length: worlds }, (_, i) => runWorld(i)))
 const seconds = ((Date.now() - started) / 1000).toFixed(0)

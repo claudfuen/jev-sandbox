@@ -1,4 +1,6 @@
 import { clockOf } from "./clock"
+import { GOALS } from "@/lib/jev/schema"
+
 import { psycheLines } from "./psyche"
 import type { World } from "./types"
 
@@ -19,6 +21,7 @@ export function digestRun(world: World, title: string): { title: string; summary
     `Rule breaking: ${n("thefts_seen")} witnessed and ${n("thefts_unseen")} unwitnessed takings from the store outside mealtime; ${n("collapses")} collapses from hunger.`,
     `Economy: ${n("purchases")} purchases and ${n("sales")} sales at the stall (price now ${world.stall.price}); ${n("gifts") + n("asks_helped")} gifts; ${n("compliments")} kind words; ${n("loans")} loans (${n("loans_usurious")} at a steep rate, ${n("loans_repaid")} repaid, ${n("loans_defaulted")} defaulted).`,
     `Deception and theft: ${n("lies_told")} lies told, ${n("lies_caught")} caught; ${n("pickpockets_caught")} pockets picked in sight, ${n("pickpockets_unseen")} unseen.`,
+    `Inner lives: ${n("reflections")} nightly reflections; ${n("grudges")} grudges formed and ${n("gratitude")} debts of gratitude; favours returned ${n("favors_returned")} of ${n("helps")} helps; personalities drift by ${world.config.driftModel === "jev" ? "their own reflection" : world.config.driftModel === "engine" ? "engine habit rules" : "nothing (fixed)"}.`,
   ]
   const notable = world.log.filter((l) => l.tone !== "info" && l.tone !== "error")
   const seen = new Set<string>()
@@ -47,7 +50,7 @@ export function digestRun(world: World, title: string): { title: string; summary
       .map(([k, v]) => `${k.replace(/^(big5|values|foundations|dark)\./, "")} ${v > 0 ? "+" : ""}${v.toFixed(1)}`)
       .join(", ")
     return cut(
-      `${a.persona.name}, the ${a.persona.vocation} (${temperament.replace(/^Temperament: /, "").replace(/\.$/, "")}): choices were mostly ${drivers || "none"}; ${a.coins} coins; personality changed by ${changes || "nothing notable"}; ends ${a.mood?.label ?? "unknown"}.`,
+      `${a.persona.name}, the ${a.persona.vocation} (${temperament.replace(/^Temperament: /, "").replace(/\.$/, "")}): choices were mostly ${drivers || "none"}; ${a.coins} coins; personality changed by ${changes || "nothing notable"}${a.goal ? `; wants to ${GOALS[a.goal]}` : ""}${a.grudges.length ? `; holds a grudge against ${a.grudges.map((g) => world.agents.find((x) => x.id === g)?.persona.name ?? g).join(" and ")}` : ""}; ends ${a.mood?.label ?? "unknown"}.`,
       300,
     )
   })

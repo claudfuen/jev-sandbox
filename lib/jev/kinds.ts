@@ -1,6 +1,14 @@
 import type { Experimental_EvaluationQuestion as EvaluationQuestion } from "ai"
 
-import { assessQuestions, buildAssessState, buildState, decideQuestions, respondQuestions } from "./prompt"
+import {
+  assessQuestions,
+  buildAssessState,
+  buildReflectState,
+  buildState,
+  decideQuestions,
+  reflectQuestions,
+  respondQuestions,
+} from "./prompt"
 import type { JevRequest } from "./schema"
 
 export type JevCall = { state: string; questions: Record<string, EvaluationQuestion> }
@@ -24,5 +32,7 @@ export function buildJevCall(req: JevRequest): JevCall {
       }
     case "assess":
       return { state: buildAssessState(req.payload), questions: assessQuestions() }
+    case "reflect":
+      return { state: buildReflectState(req.payload), questions: reflectQuestions(req.payload) }
   }
 }

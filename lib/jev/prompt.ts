@@ -1,4 +1,6 @@
 import {
+  CHANGES,
+  GOALS,
   ASSESS_HIGHLIGHTS,
   ASSESS_ROADMAP,
   MOOD_LEVELS,
@@ -11,7 +13,7 @@ import {
 } from "./schema"
 import type { Experimental_EvaluationQuestion as EvaluationQuestion } from "ai"
 import type { z } from "zod"
-import type { assessPayloadSchema } from "./schema"
+import type { assessPayloadSchema, reflectPayloadSchema } from "./schema"
 
 export const JEV_MODEL = "typesafe-ai/jev"
 
@@ -263,4 +265,71 @@ export function assessQuestions() {
       criteria: { ...ASSESS_HIGHLIGHTS },
     },
   } as const
+}
+
+// ---------------------------------------------------------------------------
+// Nightly reflection (C5): how the villager themselves reads their day.
+
+type ReflectPayload = z.infer<typeof reflectPayloadSchema>
+
+export function buildReflectState(p: ReflectPayload): string {
+  return [
+    buildState(p.perception),
+    "",
+    `${p.perception.name} is lying down to sleep and thinking back over the day.`,
+    "Today, in order:",
+    bullets(p.today.map((t, i) => `m${i}: ${t}`), "a quiet day with nothing much to remember"),
+    ...(p.currentGoal ? ["", `Their goal in life right now: to ${p.currentGoal}.`] : []),
+  ].join("\n")
+}
+
+export function reflectQuestions(p: ReflectPayload): Record<string, EvaluationQuestion> {
+  const name = p.perception.name
+  const q: Record<string, EvaluationQuestion> = {
+    meaning: {
+      type: "score",
+      instructions: `Looking back on today, how meaningful did ${name}'s day feel to them?`,
+      criteria: ["empty", "a little meaningful", "somewhat", "quite", "deeply meaningful"],
+    },
+    trust_people: {
+      type: "score",
+      instructions: `Has today left ${name} trusting the other villagers less or more?`,
+      criteria: ["much less", "a little less", "the same", "a little more", "much more"],
+    },
+    change: {
+      type: "choice",
+      instructions: `How, if at all, has today changed ${name}?`,
+      criteria: { ...CHANGES },
+    },
+    mood: moodQuestion(name),
+  }
+  if (p.today.length) {
+    q.keep = {
+      type: "choice",
+      instructions: `Which of today's moments will ${name} still carry with them years from now?`,
+      criteria: { ...Object.fromEntries(p.today.map((t, i) => [`m${i}`, t])), none: "Nothing today stands out" },
+    }
+  }
+  if (p.helpers.length) {
+    q.grateful_to = {
+      type: "choice",
+      instructions: `Who is ${name} most grateful to today?`,
+      criteria: { ...Object.fromEntries(p.helpers.map(([id, n]) => [id, n])), nobody: "Nobody in particular" },
+    }
+  }
+  if (p.wrongers.length) {
+    q.grudge = {
+      type: "choice",
+      instructions: `Is there anyone ${name} now holds a grudge against?`,
+      criteria: { ...Object.fromEntries(p.wrongers.map(([id, n]) => [id, n])), nobody: "Nobody" },
+    }
+  }
+  if (p.askGoal) {
+    q.goal = {
+      type: "choice",
+      instructions: `Given who ${name} is and the life they are living, what does ${name} most want out of life now?`,
+      criteria: { ...GOALS },
+    }
+  }
+  return q
 }

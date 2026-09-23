@@ -20,6 +20,8 @@ type Delta = [PsychePath, number]
 
 /** No trait moves more than this many points in one in-game day. */
 const DAILY_CAP = 3
+/** Nor more than this far from who they were born as, over a lifetime. */
+const LIFETIME_CAP = 25
 const DRIFT_KEEP = 60
 
 function read(p: Psyche, path: PsychePath): number {
@@ -41,10 +43,11 @@ function adjust(world: World, agent: Agent, path: PsychePath, delta: number, cau
   const allowed = delta > 0 ? Math.min(delta, DAILY_CAP - used) : Math.max(delta, -DAILY_CAP - used)
   if (Math.abs(allowed) < 1e-6) return
   const before = read(agent.psyche, path)
-  const after = Math.max(0, Math.min(100, before + allowed))
-  const applied = after - before
+  const born = read(agent.psycheAtBirth, path)
+  const bounded = Math.max(Math.max(0, born - LIFETIME_CAP), Math.min(Math.min(100, born + LIFETIME_CAP), before + allowed))
+  const applied = bounded - before
   if (Math.abs(applied) < 1e-6) return
-  write(agent.psyche, path, Math.round(after * 100) / 100)
+  write(agent.psyche, path, Math.round(bounded * 100) / 100)
   agent.driftToday.used[path] = used + applied
   const last = agent.drift.at(-1)
   if (last && last.key === path && last.cause === cause && world.tick - last.tick < 72) {
@@ -74,6 +77,7 @@ const HABITS: Partial<Record<DriverKey, Delta[]>> = {
 }
 
 export function habit(world: World, agent: Agent, drivers: DriverKey[], label: string) {
+  if (world.config.driftModel !== "engine") return
   for (const d of drivers) {
     for (const [path, delta] of HABITS[d] ?? []) adjust(world, agent, path, delta, `habit: ${label.toLowerCase()}`)
   }
@@ -103,6 +107,7 @@ const EVENTS: Record<Exclude<LifeEvent, "caught">, Delta[]> = {
 
 /** Experience: how events land depends on who they happen to. */
 export function lifeEvent(world: World, agent: Agent, event: LifeEvent, cause: string) {
+  if (world.config.driftModel !== "engine") return
   if (event === "caught") {
     // Being caught shames the agreeable into conforming and teaches the callous to be sneakier.
     const deltas: Delta[] =
@@ -113,4 +118,32 @@ export function lifeEvent(world: World, agent: Agent, event: LifeEvent, cause: s
     return
   }
   for (const [path, delta] of EVENTS[event]) adjust(world, agent, path, delta, cause)
+}
+
+// ---------------------------------------------------------------------------
+// Reflection drift (the default model): JEV reads the day and says how it
+// changed the person. The engine only translates that answer into small,
+// documented deltas.
+
+const CHANGE_DELTAS: Record<string, Delta[]> = {
+  unchanged: [],
+  more_wary: [["trust", -2], ["big5.neuroticism", 1]],
+  more_generous: [["values.benevolence", 2], ["big5.agreeableness", 1]],
+  more_guarded: [["big5.extraversion", -1], ["trust", -1]],
+  more_ambitious: [["values.achievement", 2], ["values.power", 1]],
+  more_content: [["big5.neuroticism", -2], ["values.hedonism", 1]],
+  closer_to_family: [["values.benevolence", 1], ["foundations.loyalty", 2]],
+  devoted_to_work: [["big5.conscientiousness", 2], ["values.achievement", 1]],
+  more_ruthless: [["dark.machiavellianism", 2], ["values.benevolence", -1]],
+  more_bitter: [["trust", -2], ["big5.agreeableness", -1]],
+}
+
+export function reflectDrift(world: World, agent: Agent, change: string, trustEv: number) {
+  if (world.config.driftModel !== "jev") return
+  const t = trustEv - 2
+  if (Math.abs(t) > 0.05) {
+    adjust(world, agent, "trust", 1.5 * t, "reflection: trust in others")
+    adjust(world, agent, "big5.agreeableness", 0.5 * t, "reflection: trust in others")
+  }
+  for (const [path, delta] of CHANGE_DELTAS[change] ?? []) adjust(world, agent, path, delta, `reflection: ${change.replace(/_/g, " ")}`)
 }

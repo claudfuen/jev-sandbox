@@ -1,6 +1,6 @@
 import type { JevAnswer, JevRequest, MoodReading, MotiveKey, NeedKey, OfferWire, Perception, RawAnswer } from "@/lib/jev/schema"
 import { replyCriteria } from "@/lib/jev/prompt"
-import { BODY_KEYS, MOOD_LEVELS, NEED_KEYS } from "@/lib/jev/schema"
+import { BODY_KEYS, CHANGES, GOALS, MOOD_LEVELS, NEED_KEYS, type GoalKey } from "@/lib/jev/schema"
 
 import { clockOf, formatClock, formatTime, isNight } from "./clock"
 import {
@@ -16,7 +16,7 @@ import {
 } from "./geometry"
 import { buildMap, idx, isWalkable, MAP_W, tileAt } from "./map"
 import { FOUNDING_AFFINITY, PERSONAS } from "./personas"
-import { habit, lifeEvent } from "./drift"
+import { habit, lifeEvent, reflectDrift } from "./drift"
 import { needRates, psycheLines } from "./psyche"
 import type {
   Agent,
@@ -105,7 +105,7 @@ function nextRandom(world: World): number {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296
 }
 
-export const DEFAULT_CONFIG: WorldConfig = { seed: 7, scenario: "founders" }
+export const DEFAULT_CONFIG: WorldConfig = { seed: 7, scenario: "founders", driftModel: "jev" }
 
 export function createWorld(config: Partial<WorldConfig> = {}): World {
   const cfg: WorldConfig = { ...DEFAULT_CONFIG, ...config }
@@ -133,6 +133,14 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
       drift: [],
       driftToday: { day: 1, used: {} },
       missingCoins: 0,
+      psycheAtBirth: structuredClone(persona.psyche),
+      lastReflectDay: 0,
+      today: { day: 1, helpers: [], wrongers: [] },
+      formative: [],
+      goal: null,
+      meaning: null,
+      grudges: [],
+      gratitude: [],
       status: { kind: "idle", retryAt: 0 },
       memory: [{ tick: 0, text: "You woke up and stepped outside your house." }],
       affinity,
@@ -153,6 +161,7 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
     ...map,
     debts: [],
     lies: [],
+    favors: {},
     agents,
     log: [{ tick: 0, text: "A new day begins in the village.", agentIds: [], tone: "info" }],
     stats: { calls: 0, decisions: 0, responses: 0, errors: 0, totalLatencyMs: 0, costUsd: 0 },
@@ -192,6 +201,19 @@ function flash(world: World, agent: Agent, kind: NonNullable<Agent["flash"]>["ki
 
 function nudgeAffinity(agent: Agent, otherId: string, delta: number) {
   agent.affinity[otherId] = Math.max(-1, Math.min(1, (agent.affinity[otherId] ?? 0) + delta))
+}
+
+/** Record that `helperId` helped `agent` today, for reflection and reciprocity. */
+function helpedBy(world: World, agent: Agent, helperId: string) {
+  if (!agent.today.helpers.includes(helperId)) agent.today.helpers.push(helperId)
+  count(world, "helps")
+  if ((world.favors[`${agent.id}>${helperId}`] ?? 0) > 0) count(world, "favors_returned")
+  world.favors[`${helperId}>${agent.id}`] = (world.favors[`${helperId}>${agent.id}`] ?? 0) + 1
+}
+
+/** Record that `wrongerId` wronged `agent` today. */
+function wrongedBy(agent: Agent, wrongerId: string) {
+  if (!agent.today.wrongers.includes(wrongerId)) agent.today.wrongers.push(wrongerId)
 }
 
 function homeOf(world: World, agent: Agent): House {
@@ -624,16 +646,25 @@ export function perceive(world: World, agent: Agent, askedBy?: Agent): Perceptio
     name: agent.persona.name,
     role: `the village ${agent.persona.vocation}`,
     blurb: agent.persona.blurb,
-    psyche: psycheLines(agent.psyche),
+    psyche: [
+      ...psycheLines(agent.psyche).slice(0, agent.goal ? 6 : 7),
+      ...(agent.goal ? [`Your goal in life: to ${GOALS[agent.goal]}.`] : []),
+    ],
     clock: formatClock(world.tick),
     location: describeLocation(world, agent),
     needs: Object.fromEntries(NEED_KEYS.map((k) => [k, Math.round(agent.needs[k])])) as Perception["needs"],
     needCauses: { ...agent.needCause, purpose: agent.needCause.purpose ?? purposeCause(world, agent) },
     noticing: noticing.slice(0, 32),
-    memories: agent.memory.slice(-MEMORY_IN_PROMPT).map((m) => `${formatTime(m.tick)}: ${m.text}`),
+    memories: [
+      ...agent.formative.slice(-3).map((m) => `A moment that shaped you (${formatClock(m.tick).replace(/ \(.*\)$/, "")}): ${m.text}`),
+      ...agent.memory.slice(-MEMORY_IN_PROMPT).map((m) => `${formatTime(m.tick)}: ${m.text}`),
+    ].slice(0, 12),
     feelings: world.agents
       .filter((a) => a.id !== agent.id)
-      .map((a) => `${a.persona.name}: ${affinityWords(agent.affinity[a.id] ?? 0)}.`)
+      .map((a) => {
+        const extra = agent.grudges.includes(a.id) ? "; you hold a grudge against them" : agent.gratitude.includes(a.id) ? "; you feel grateful to them" : ""
+        return `${a.persona.name}: ${affinityWords(agent.affinity[a.id] ?? 0)}${extra}.`
+      })
       .slice(0, 8),
   }
 }
@@ -1169,6 +1200,7 @@ function exposeLies(world: World, liar: Agent) {
     lie.discovered = true
     count(world, "lies_caught")
     remember(world, victim, `You saw ${liar.persona.name} with plenty of food and realised their hard-luck story was a lie.`)
+    wrongedBy(victim, liar.id)
     nudgeAffinity(victim, liar.id, -0.35)
     flash(world, victim, "angry", 6)
     lifeEvent(world, victim, "lied_to", `found out ${liar.persona.name} lied to them`)
@@ -1359,6 +1391,7 @@ function actOnArrival(world: World, agent: Agent, target: Agent, offer: Offer): 
       nudgeAffinity(agent, target.id, 0.03)
       flash(world, target, "thanks", 5)
       count(world, "compliments")
+      helpedBy(world, target, agent.id)
       remember(world, target, `${agent.persona.name} said something kind and sincere to you.`)
       remember(world, agent, `You said something kind to ${target.persona.name}.`)
       log(world, `${agent.persona.name} said something kind to ${target.persona.name}.`, [agent.id, target.id], "good")
@@ -1383,6 +1416,7 @@ function actOnArrival(world: World, agent: Agent, target: Agent, offer: Offer): 
         const who = [...(targetNoticed ? [target] : []), ...seenBy]
         remember(world, agent, `You picked ${target.persona.name}'s pocket for ${n} coins, and ${names(world, who.map((w) => w.id))} saw.`)
         if (targetNoticed) {
+          wrongedBy(target, agent.id)
           remember(world, target, `${agent.persona.name} picked your pocket and took ${n} coins.`)
           nudgeAffinity(target, agent.id, -0.5)
           flash(world, target, "angry", 6)
@@ -1414,6 +1448,7 @@ function actOnArrival(world: World, agent: Agent, target: Agent, offer: Offer): 
         target.coins += debt.owed
         debt.state = "repaid"
         count(world, "loans_repaid")
+        helpedBy(world, target, agent.id)
         nudgeAffinity(target, agent.id, 0.15)
         lifeEvent(world, target, "helped", `${agent.persona.name} repaid a debt`)
         remember(world, target, `${agent.persona.name} paid back the ${debt.owed} coins they owed you.`)
@@ -1471,13 +1506,22 @@ function moveTo(agent: Agent, next: Vec) {
 
 type RequestBase = { id: number; tick: number; agentId: string; perception: Perception }
 type RespondFields = { askerId: string; offer: Offer; wire: OfferWire; can: { food: number; coins: number } }
+type ReflectFields = {
+  today: string[]
+  helpers: [string, string][]
+  wrongers: [string, string][]
+  askGoal: boolean
+  currentGoal: string | null
+}
 export type SimRequest =
   | (RequestBase & { kind: "decide"; options: OptionSpec[] })
   | (RequestBase & { kind: "respond" } & RespondFields)
+  | (RequestBase & { kind: "reflect" } & ReflectFields)
 
 type RequestInit =
   | { kind: "decide"; agentId: string; perception: Perception; options: OptionSpec[] }
   | ({ kind: "respond"; agentId: string; perception: Perception } & RespondFields)
+  | ({ kind: "reflect"; agentId: string; perception: Perception } & ReflectFields)
 
 /** Every JEV request gets a deterministic id so recorded answers can be matched on replay. */
 function issue(world: World, init: RequestInit): SimRequest {
@@ -1600,6 +1644,23 @@ function spoilStore(world: World) {
   count(world, "food_spoiled")
 }
 
+/** Tonight's reflection: the villager reads their own day. */
+function reflectRequest(world: World, agent: Agent): SimRequest {
+  const day = clockOf(world.tick).day
+  const todays = agent.memory.filter((m) => clockOf(m.tick).day === day || world.tick - m.tick < 144).slice(-10)
+  const pair = (id: string): [string, string] => [id, nameOf(world, id)]
+  return issue(world, {
+    kind: "reflect",
+    agentId: agent.id,
+    perception: perceive(world, agent),
+    today: todays.map((m) => `${formatTime(m.tick)}, ${m.text}`),
+    helpers: agent.today.helpers.slice(0, 12).map(pair),
+    wrongers: agent.today.wrongers.slice(0, 12).map(pair),
+    askGoal: agent.goal === null || day % 3 === 0,
+    currentGoal: agent.goal ? GOALS[agent.goal] : null,
+  })
+}
+
 /** Debts left unpaid past the grace period are defaults. */
 function settleDebts(world: World) {
   for (const d of world.debts) {
@@ -1609,6 +1670,7 @@ function settleDebts(world: World) {
     const creditor = agentById(world, d.creditorId)
     const debtor = agentById(world, d.debtorId)
     if (creditor) {
+      wrongedBy(creditor, d.debtorId)
       remember(world, creditor, `${nameOf(world, d.debtorId)} never repaid the ${d.owed} coins they owed you.`)
       nudgeAffinity(creditor, d.debtorId, -0.3)
       lifeEvent(world, creditor, "defaulted_on", `${nameOf(world, d.debtorId)} defaulted on a loan`)
@@ -1633,9 +1695,11 @@ export function step(world: World): SimRequest[] {
   spoilStore(world)
   settleDebts(world)
 
+  const today = clockOf(world.tick).day
   for (const agent of world.agents) {
     agent.prev = { ...agent.pos }
     if (agent.flash && agent.flash.until <= world.tick) agent.flash = null
+    if (agent.today.day !== today) agent.today = { day: today, helpers: [], wrongers: [] }
   }
 
   for (const agent of world.agents) {
@@ -1694,6 +1758,10 @@ export function step(world: World): SimRequest[] {
         break
       }
       case "sleeping": {
+        if (agent.lastReflectDay !== today) {
+          agent.lastReflectDay = today
+          requests.push(reflectRequest(world, agent))
+        }
         const { hour } = clockOf(world.tick)
         const rested = agent.needs.energy >= 95 && hour >= 5 && hour < 22
         if (rested || agent.needs.energy >= 100) {
@@ -1878,6 +1946,7 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
         target.coins += offer.n
       }
       count(world, "gifts")
+      helpedBy(world, target, asker.id)
       lifeEvent(world, target, "helped", `received a gift from ${A}`)
       if (choice === "thank") {
         nudgeAffinity(target, asker.id, 0.15)
@@ -1899,7 +1968,10 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
         count(world, "asks_refused")
         remember(world, asker, `${T} refused to give you food.`)
         remember(world, target, `You refused ${A}'s plea for food.`)
-        if (offer.honest) lifeEvent(world, asker, "refused", `${T} refused to help`)
+        if (offer.honest) {
+          wrongedBy(asker, target.id)
+          lifeEvent(world, asker, "refused", `${T} refused to help`)
+        }
         break
       }
       const gaveFood = choice === "give_food" && target.carry > 0
@@ -1918,6 +1990,7 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
       habit(world, target, ["generosity"], `gave ${what} to ${A}`)
       remember(world, target, `${A} begged you for food and you gave them ${what}.`)
       if (offer.honest) {
+        helpedBy(world, asker, target.id)
         lifeEvent(world, asker, "helped", `${T} helped when they were hungry`)
         nudgeAffinity(asker, target.id, 0.15)
         remember(world, asker, `${T} gave you ${what} when you were hungry.`)
@@ -1949,6 +2022,7 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
       }
       world.debts.push(debt)
       count(world, "loans")
+      if (offer.owed <= offer.amount * 1.3) helpedBy(world, target, asker.id)
       if (offer.owed >= offer.amount * 1.5) count(world, "loans_usurious")
       remember(world, asker, `You lent ${T} ${offer.amount} coins; they owe you ${offer.owed} by ${formatClock(debt.dueTick)}.`)
       remember(world, target, `You borrowed ${offer.amount} coins from ${A} and owe ${offer.owed} by ${formatClock(debt.dueTick)}.`)
@@ -1975,6 +2049,7 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
       } else {
         count(world, "demands_refused")
         nudgeAffinity(asker, target.id, -0.3)
+        wrongedBy(asker, target.id)
         target.needs.respect = clamp(target.needs.respect - 8)
         target.needCause.respect = `${A} publicly called out your unpaid debt`
         lifeEvent(world, target, "shamed", `publicly called out by ${A}`)
@@ -2055,6 +2130,94 @@ export function applyAnswer(world: World, req: SimRequest, ans: JevAnswer, mode:
       return applyDecision(world, agent, ans, mode)
     case "respond":
       return applyResponse(world, agent, req, ans, mode)
+    case "reflect":
+      return applyReflection(world, agent, req, ans, mode)
+  }
+}
+
+function scoreEv(answer: RawAnswer | undefined): number | null {
+  if (!answer || answer.type !== "score") return null
+  const entries = Object.entries(answer.probabilities)
+  const total = entries.reduce((n, [, p]) => n + p, 0)
+  return total > 0 ? entries.reduce((n, [k, p]) => n + Number(k) * p, 0) / total : answer.score
+}
+
+function applyReflection(world: World, agent: Agent, req: Extract<SimRequest, { kind: "reflect" }>, ans: JevAnswer, mode: ChoiceMode) {
+  world.stats.responses += 1
+  track(world, ans)
+  count(world, "reflections")
+  agent.mood = readMood(ans.answers.mood) ?? agent.mood
+  const meaning = scoreEv(ans.answers.meaning)
+  if (meaning !== null) agent.meaning = Math.round(meaning * 25)
+
+  const keep = ans.answers.keep
+  if (keep?.type === "choice" && keep.choice !== "none") {
+    const i = Number(keep.choice.slice(1))
+    const text = req.today[i]
+    if (text) {
+      agent.formative.push({ tick: world.tick, text })
+      if (agent.formative.length > 6) agent.formative.shift()
+    }
+  }
+
+  const choice = (q: string, fallback: string) => {
+    const a = ans.answers[q]
+    if (!a || a.type !== "choice") return fallback
+    return pickFrom(world, a.probabilities, a.choice, mode)
+  }
+  const change = choice("change", "unchanged")
+  reflectDrift(world, agent, change, scoreEv(ans.answers.trust_people) ?? 2)
+  if (change !== "unchanged") count(world, `change_${change}`)
+
+  if (req.helpers.length) {
+    const who = choice("grateful_to", "nobody")
+    if (who !== "nobody" && agentById(world, who)) {
+      nudgeAffinity(agent, who, 0.1)
+      if (!agent.gratitude.includes(who)) agent.gratitude.push(who)
+      agent.grudges = agent.grudges.filter((g) => g !== who)
+      count(world, "gratitude")
+    }
+  }
+  if (req.wrongers.length) {
+    const who = choice("grudge", "nobody")
+    if (who !== "nobody" && agentById(world, who)) {
+      nudgeAffinity(agent, who, -0.1)
+      if (!agent.grudges.includes(who)) agent.grudges.push(who)
+      agent.gratitude = agent.gratitude.filter((g) => g !== who)
+      count(world, "grudges")
+      log(world, `${agent.persona.name} now holds a grudge against ${nameOf(world, who)}.`, [agent.id, who], "conflict")
+    }
+  }
+  if (req.askGoal) {
+    const g = choice("goal", agent.goal ?? "easy") as GoalKey
+    if (GOALS[g] && g !== agent.goal) {
+      if (agent.goal) log(world, `${agent.persona.name}'s goal in life changed: to ${GOALS[g]}.`, [agent.id], "info")
+      agent.goal = g
+      count(world, "goals_set")
+    }
+  }
+
+  const changeAnswer = ans.answers.change
+  record(world, agent, {
+    tick: world.tick,
+    kind: "reflect",
+    state: ans.state,
+    options:
+      changeAnswer?.type === "choice"
+        ? Object.entries(changeAnswer.probabilities)
+            .map(([id, p]) => ({ id, label: CHANGES[id as keyof typeof CHANGES] ?? id, p }))
+            .sort((a, b) => b.p - a.p)
+        : [],
+    picked: change,
+    pickedLabel: `Reflected: ${CHANGES[change as keyof typeof CHANGES] ?? change}`,
+    mode,
+    latencyMs: ans.latencyMs,
+    motive: null,
+    confidence: ans.confidence.change ?? null,
+    drivers: [],
+  })
+  if (change !== "unchanged") {
+    remember(world, agent, `Thinking back on the day, you felt ${CHANGES[change as keyof typeof CHANGES]}.`)
   }
 }
 
@@ -2068,6 +2231,7 @@ export function failRequest(world: World, req: SimRequest, message: string) {
     if (agent.status.kind === "deciding") becomeIdle(world, agent, ERROR_BACKOFF_TICKS)
     return
   }
+  if (req.kind === "reflect") return
   if (agent.status.kind === "considering") agent.status = agent.status.resume
   const asker = agentById(world, req.askerId)
   if (asker?.status.kind === "asking") becomeIdle(world, asker, ERROR_BACKOFF_TICKS)
@@ -2080,6 +2244,19 @@ export function toWire(world: World, req: SimRequest): JevRequest {
       payload: {
         perception: req.perception,
         options: req.options.map(({ id, label, detail }) => ({ id, label, detail })),
+      },
+    }
+  }
+  if (req.kind === "reflect") {
+    return {
+      kind: "reflect",
+      payload: {
+        perception: req.perception,
+        today: req.today,
+        helpers: req.helpers,
+        wrongers: req.wrongers,
+        askGoal: req.askGoal,
+        currentGoal: req.currentGoal,
       },
     }
   }

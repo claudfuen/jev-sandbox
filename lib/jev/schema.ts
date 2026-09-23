@@ -88,6 +88,45 @@ export const respondPayloadSchema = z.object({
   can: z.object({ food: z.number().int().min(0).max(20), coins: z.number().int().min(0).max(500) }),
 })
 
+/** How a night's reflection can say someone changed. Each maps to small, documented psyche deltas. */
+export const CHANGES = {
+  unchanged: "they are the same person as this morning",
+  more_wary: "a little more wary of other people",
+  more_generous: "a little more generous",
+  more_guarded: "a little more guarded and private",
+  more_ambitious: "a little more ambitious",
+  more_content: "a little more at peace",
+  closer_to_family: "a little closer to family and friends",
+  devoted_to_work: "a little more devoted to their work",
+  more_ruthless: "a little more willing to do whatever it takes",
+  more_bitter: "a little more bitter",
+} as const
+export type ChangeKey = keyof typeof CHANGES
+
+/** Life goals a villager can hold. Chosen by JEV in reflection. */
+export const GOALS = {
+  respected: "become one of the most respected people in the village",
+  build: "build something lasting for the village",
+  wealth: "grow rich",
+  family: "take care of family and friends",
+  adventure: "find adventure and discover new things",
+  easy: "live an easy, pleasant life",
+  revenge: "get even with someone who wronged them",
+  tradition: "keep the old ways alive",
+} as const
+export type GoalKey = keyof typeof GOALS
+
+export const reflectPayloadSchema = z.object({
+  perception: perceptionSchema,
+  /** Today's memories, oldest first, as m0..m9. */
+  today: z.array(line).max(10),
+  /** Villagers who helped or wronged them today: [id, name]. */
+  helpers: z.array(z.tuple([z.string().regex(/^[a-z0-9_]{1,40}$/), z.string().max(40)])).max(12),
+  wrongers: z.array(z.tuple([z.string().regex(/^[a-z0-9_]{1,40}$/), z.string().max(40)])).max(12),
+  askGoal: z.boolean(),
+  currentGoal: z.string().max(120).nullable(),
+})
+
 export const ASSESS_ROADMAP = {
   economy: "an economy: money, buying, selling, trade, exploitation and charity",
   trait_evolution: "personalities that change over time from what people do and what happens to them",
@@ -123,6 +162,7 @@ export const jevRequestSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("decide"), payload: decidePayloadSchema }),
   z.object({ kind: z.literal("respond"), payload: respondPayloadSchema }),
   z.object({ kind: z.literal("assess"), payload: assessPayloadSchema }),
+  z.object({ kind: z.literal("reflect"), payload: reflectPayloadSchema }),
 ])
 
 export type Needs = z.infer<typeof needsSchema>

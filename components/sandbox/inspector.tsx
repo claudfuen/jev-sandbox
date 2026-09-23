@@ -6,7 +6,7 @@ import { cn } from "cn"
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { NEED_NAMES, needWord } from "@/lib/jev/prompt"
-import { MOOD_LEVELS, MOTIVES, NEED_KEYS, type NeedKey } from "@/lib/jev/schema"
+import { GOALS, MOOD_LEVELS, MOTIVES, NEED_KEYS, type NeedKey } from "@/lib/jev/schema"
 import { formatTime } from "@/lib/sim/clock"
 import { describeLocation, describeStatus } from "@/lib/sim/engine"
 import { FOUNDATION_KEYS, psycheLines, VALUE_KEYS } from "@/lib/sim/psyche"
@@ -208,7 +208,10 @@ function RelationsTab({ world, agent }: { world: World; agent: Agent }) {
               return (
                 <div key={other.id} className="grid grid-cols-[1.25rem_4.5rem_1fr_2.5rem] items-center gap-2 text-sm">
                   <Avatar persona={other.persona} size={20} />
-                  <span className="text-muted-foreground">{other.persona.name}</span>
+                  <span className="truncate text-muted-foreground" title={agent.grudges.includes(other.id) ? "holds a grudge" : agent.gratitude.includes(other.id) ? "grateful" : ""}>
+                    {other.persona.name}
+                    {agent.grudges.includes(other.id) ? " ⚡" : agent.gratitude.includes(other.id) ? " ♥" : ""}
+                  </span>
                   <Meter value={((v + 1) / 2) * 100} tone={v < 0 ? "muted" : "default"} />
                   <span className="text-right text-xs text-muted-foreground tabular-nums">{v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2)}</span>
                 </div>
@@ -237,6 +240,32 @@ function PsycheTab({ agent }: { agent: Agent }) {
   const totalDrivers = drivers.reduce((n, [, v]) => n + (v ?? 0), 0)
   return (
     <div className="flex flex-col gap-5">
+      {(agent.goal || agent.meaning !== null || agent.formative.length > 0) && (
+        <Section title="Inner life">
+          <div className="flex flex-col gap-2 rounded-lg border bg-muted/40 p-3 text-[13px] leading-snug">
+            {agent.goal && (
+              <p>
+                <span className="font-medium">Goal in life:</span> to {GOALS[agent.goal]}
+              </p>
+            )}
+            {agent.meaning !== null && (
+              <p>
+                <span className="font-medium">Last night:</span> the day felt {agent.meaning >= 75 ? "deeply meaningful" : agent.meaning >= 50 ? "quite meaningful" : agent.meaning >= 25 ? "somewhat meaningful" : "empty"} ({agent.meaning}/100)
+              </p>
+            )}
+            {agent.formative.length > 0 && (
+              <div>
+                <span className="font-medium">Moments that shaped them:</span>
+                <ul className="mt-1 list-disc pl-4 text-muted-foreground">
+                  {agent.formative.map((m, i) => (
+                    <li key={`${m.tick}-${i}`}>{m.text}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </Section>
+      )}
       <Section title="Who they are, as JEV reads it">
         <ul className="flex flex-col gap-1.5 rounded-lg border bg-muted/40 p-3 text-[13px] leading-snug">
           {psycheLines(p).map((line) => (

@@ -1,4 +1,4 @@
-import type { MoodReading, MotiveKey, Needs, NeedKey } from "@/lib/jev/schema"
+import type { GoalKey, MoodReading, MotiveKey, Needs, NeedKey } from "@/lib/jev/schema"
 
 import type { Psyche } from "./psyche"
 
@@ -23,8 +23,67 @@ export type Tile =
   | "site"
   | "store"
   | "stall"
+  // Fernhollow town tiles
+  | "building"
+  | "lot"
+  | "bridge_lot"
+  | "scaffold"
+  | "bridge"
+  | "field"
+  | "fountain"
+  | "board"
+  | "dock"
+  | "grave"
+  | "fence"
+  | "ford"
 
 export type House = { id: string; residents: string[]; x: number; y: number; door: Vec }
+
+/** Town buildings (Fernhollow). Interiors are abstract: people inside a building can see each other. */
+export type BuildingKind =
+  | "home"
+  | "farmhouse"
+  | "clinic"
+  | "police"
+  | "town_hall"
+  | "school"
+  | "chapel"
+  | "store"
+  | "diner"
+  | "inn"
+  | "crier"
+  | "workshop"
+
+export type Building = {
+  /** e.g. "b_clinic", "h_vale", "h_harrow" */
+  id: string
+  kind: BuildingKind
+  /** e.g. "the clinic", "the Vale house" */
+  name: string
+  /** Top-left footprint tile and size in tiles. */
+  pos: Vec
+  size: Vec
+  /** The single door tile, walkable, in the bottom row, opening onto a lane. */
+  door: Vec
+  /** Posted hours: minutes of day and ISO weekdays (1 = Monday .. 7 = Sunday); null for homes and always-open places. */
+  hours: { open: number; close: number; days: number[] } | null
+  /** Persona ids of the people who live here (homes, and the inn for the innkeeper). */
+  residents: string[]
+}
+
+export type JobId =
+  | "mayor"
+  | "police_officer"
+  | "doctor"
+  | "nurse"
+  | "teacher"
+  | "journalist"
+  | "carpenter"
+  | "shopkeeper"
+  | "cook"
+  | "innkeeper"
+  | "farmer"
+  | "fisher"
 export type Bush = { id: string; pos: Vec; berries: number; nextRegrow: number }
 export type Poi = { id: string; name: string; stand: Vec }
 export type Landmark = { name: string; center: Vec; radius: number; houseId?: string }
@@ -157,7 +216,7 @@ export type ChoiceMode = "sample" | "argmax"
 
 export type DecisionRecord = {
   tick: number
-  kind: "decide" | "respond"
+  kind: "decide" | "respond" | "reflect"
   state: string
   options: { id: string; label: string; p: number }[]
   picked: string
@@ -196,6 +255,18 @@ export type Agent = {
   driftToday: { day: number; used: Record<string, number> }
   /** Coins stolen without them noticing yet; discovered at their next decision. */
   missingCoins: number
+  /** The psyche they were born with; reflection drift is capped relative to it. */
+  psycheAtBirth: Psyche
+  lastReflectDay: number
+  /** Who helped and who wronged them today, for tonight's reflection. */
+  today: { day: number; helpers: string[]; wrongers: string[] }
+  /** Moments JEV said they will carry for years. */
+  formative: MemoryEntry[]
+  goal: GoalKey | null
+  /** How meaningful last night's reflection said the day was, 0..100. */
+  meaning: number | null
+  grudges: string[]
+  gratitude: string[]
   status: Status
   memory: MemoryEntry[]
   affinity: Record<string, number>
@@ -224,7 +295,13 @@ export type Stats = {
   costUsd: number
 }
 
-export type WorldConfig = { seed: number; scenario: string }
+/**
+ * How personalities change. "jev": only through JEV's nightly reflection (default).
+ * "engine": engine rules for habit and experience (lib/sim/drift.ts). "off": fixed.
+ */
+export type DriftModel = "jev" | "engine" | "off"
+
+export type WorldConfig = { seed: number; scenario: string; driftModel: DriftModel }
 
 /** Observer interventions. Recorded with the run so replays reproduce them. */
 export type Intervention =
@@ -252,6 +329,8 @@ export type World = {
   stall: Stall
   debts: Debt[]
   lies: Lie[]
+  /** Help given from one villager to another, "from>to" to count, for reciprocity. */
+  favors: Record<string, number>
   agents: Agent[]
   log: LogEntry[]
   stats: Stats

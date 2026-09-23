@@ -70,6 +70,22 @@ function fakeAnswer(req: SimRequest): JevAnswer {
     const motive = { type: "choice" as const, choice: "purpose", probabilities: { purpose: 0.6, gain: 0.4 } }
     return { kind: "decide", state: "", answers: { action: { type: "choice", choice, probabilities }, mood, motive }, confidence: { action: 0.5 }, latencyMs: 300, costUsd: 0.00002 }
   }
+  if (req.kind === "reflect") {
+    const score = (n: number) => ({ type: "score" as const, score: n, probabilities: { [String(n)]: 1 } })
+    const pickOf = (ids: string[]) => ids[Math.floor(h(5) * ids.length)]
+    const one = (id: string) => ({ type: "choice" as const, choice: id, probabilities: { [id]: 1 } })
+    const answers: JevAnswer["answers"] = {
+      meaning: score(Math.floor(h(6) * 5)),
+      trust_people: score(Math.floor(h(7) * 5)),
+      change: one(pickOf(["unchanged", "more_wary", "more_generous", "more_ruthless", "more_content"])),
+      mood,
+    }
+    if (req.today.length) answers.keep = one(`m${Math.floor(h(8) * req.today.length)}`)
+    if (req.helpers.length) answers.grateful_to = one(req.helpers[0][0])
+    if (req.wrongers.length) answers.grudge = one(req.wrongers[0][0])
+    if (req.askGoal) answers.goal = one(pickOf(["build", "wealth", "family", "revenge"]))
+    return { kind: "reflect", state: "", answers, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
+  }
   if (req.wire.kind === "chat") {
     return { kind: "respond", state: "", answers: { engage: { type: "boolean", probability: h(3) }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
   }
@@ -181,11 +197,30 @@ describe("economy and moral actions", () => {
     expect(total(session.world)).toBe(before)
   })
 
-  test("personality drifts with habits, within the daily cap", () => {
-    const session = new Session({ seed: 13 })
+  test("personality drifts, within the daily cap, under both drift models", () => {
+    const session = new Session({ seed: 13, driftModel: "engine" })
     for (let t = 0; t < 600; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
     const drifted = session.world.agents.filter((a) => a.drift.length > 0)
     expect(drifted.length).toBeGreaterThan(3)
     for (const a of session.world.agents) for (const used of Object.values(a.driftToday.used)) expect(Math.abs(used)).toBeLessThanOrEqual(3.0001)
+  })
+})
+
+describe("reflection", () => {
+  test("nightly reflections set goals, formative memories and drift under the jev model", () => {
+    const session = new Session({ seed: 21, driftModel: "jev" })
+    for (let t = 0; t < 700; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+    const w = session.world
+    expect(w.counters.reflections ?? 0).toBeGreaterThan(5)
+    expect(w.agents.some((a) => a.goal !== null)).toBe(true)
+    expect(w.agents.some((a) => a.formative.length > 0)).toBe(true)
+    expect(w.agents.some((a) => a.drift.some((d) => d.cause.startsWith("reflection")))).toBe(true)
+    expect(w.agents.every((a) => a.drift.every((d) => d.cause.startsWith("reflection")))).toBe(true)
+  })
+
+  test("drift is off under the off model", () => {
+    const session = new Session({ seed: 22, driftModel: "off" })
+    for (let t = 0; t < 700; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+    expect(session.world.agents.every((a) => a.drift.length === 0)).toBe(true)
   })
 })

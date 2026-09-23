@@ -1,0 +1,35 @@
+app/api/jev/route.ts
+  s_10969b22d81ab1::t_89eaef0965201c 1-2,4-5,13,15
+lib/sim/metrics.ts
+  s_10969b22d81ab1::t_318618baeba62e 1-70
+lib/sim/session.ts
+  s_10969b22d81ab1::t_6f100a45270fc7 1-109,112-123,125-224
+scripts/lab.ts
+  s_10969b22d81ab1::t_9001789725459b 1-155
+components/sandbox/runs-gallery.tsx
+  s_10969b22d81ab1::t_91a7e951538ba4 1-164
+lib/jev/kinds.ts
+  s_10969b22d81ab1::t_238f1fe5d433df 1-26
+lib/jev/call.ts
+  s_10969b22d81ab1::t_94ae82636a3fcf 1-63
+components/sandbox/replay-viewer.tsx
+  s_10969b22d81ab1::t_539476c0171f2c 1-161
+components/sandbox/use-sandbox.ts
+  s_10969b22d81ab1::t_4d9b17c2abaf3d 5-8,17,23,27,31-33,54-60,62,65,85-91,104-105,108,112-131,147-150,152-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "62cf928d53a8b8b08f5d52060294fa483035a620",
+  "prompts": {},
+  "sessions": {
+    "s_10969b22d81ab1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a0b1f25e-515e-477d-83fb-661b0d8bb6a2",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Claudio Fuentes <imclaudfuen@gmail.com>"
+    }
+  }
+}

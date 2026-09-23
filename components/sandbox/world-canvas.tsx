@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef, type RefObject } from "react"
+import { useEffect, useRef, useState, type RefObject } from "react"
 
 import { darkness } from "@/lib/sim/clock"
 import { MAP_H, MAP_W, TILE, tileAt } from "@/lib/sim/map"
@@ -121,8 +121,27 @@ type Props = {
   onSelect: (id: string) => void
 }
 
+/** Largest box with the world's aspect ratio that fits inside the frame. */
+function useFit(frameRef: RefObject<HTMLDivElement | null>) {
+  const [fit, setFit] = useState<{ width: number; height: number } | null>(null)
+  useEffect(() => {
+    const frame = frameRef.current
+    if (!frame) return
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      const scale = Math.min(width / W, height / H)
+      setFit({ width: Math.floor(W * scale), height: Math.floor(H * scale) })
+    })
+    observer.observe(frame)
+    return () => observer.disconnect()
+  }, [frameRef])
+  return fit
+}
+
 export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const frameRef = useRef<HTMLDivElement>(null)
+  const fit = useFit(frameRef)
   const selectedRef = useRef(selectedId)
   selectedRef.current = selectedId
 
@@ -232,14 +251,17 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
   }
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={W * SCALE}
-      height={H * SCALE}
-      onClick={handleClick}
-      className="block aspect-[8/5] w-full cursor-pointer [image-rendering:pixelated]"
-      aria-label="Village simulation. Click a character to inspect them."
-    />
+    <div ref={frameRef} className="absolute inset-0 flex items-center justify-center">
+      <canvas
+        ref={canvasRef}
+        width={W * SCALE}
+        height={H * SCALE}
+        onClick={handleClick}
+        style={fit ? { width: fit.width, height: fit.height } : { visibility: "hidden" }}
+        className="block cursor-pointer rounded-md [image-rendering:pixelated]"
+        aria-label="Village simulation. Click a character to inspect them."
+      />
+    </div>
   )
 }
 

@@ -3,7 +3,7 @@ import { experimental_evaluate as evaluate } from "ai"
 import { ensureGatewayKey } from "./gateway-key"
 import { buildJevCall } from "./kinds"
 import { JEV_MODEL } from "./prompt"
-import type { JevAnswer, JevRequest, RawAnswer } from "./schema"
+import { jevRequestSchema, type JevAnswer, type JevRequest, type RawAnswer } from "./schema"
 
 // Server-only: the one place that talks to JEV. The route and the lab runner
 // both go through here, so live runs and headless experiments are identical.
@@ -39,7 +39,9 @@ function readConfidence(providerMetadata: unknown): Record<string, number> {
   return confidence ?? {}
 }
 
-export async function runJev(req: JevRequest, signal?: AbortSignal): Promise<JevAnswer> {
+export async function runJev(input: JevRequest, signal?: AbortSignal): Promise<JevAnswer> {
+  // Validate here too, so headless runs obey exactly the contract the public route enforces.
+  const req = jevRequestSchema.parse(input) as JevRequest
   ensureGatewayKey()
   const { state, questions } = buildJevCall(req)
   const started = Date.now()

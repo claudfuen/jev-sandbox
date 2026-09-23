@@ -1,4 +1,6 @@
-import type { MoodReading, Needs, NeedKey } from "@/lib/jev/schema"
+import type { MoodReading, MotiveKey, Needs, NeedKey } from "@/lib/jev/schema"
+
+import type { Psyche } from "./psyche"
 
 export type Vec = { x: number; y: number }
 export type Dir = "up" | "down" | "left" | "right"
@@ -18,22 +20,66 @@ export type Tile =
   | "well"
   | "sign"
   | "rock"
+  | "site"
+  | "store"
 
-export type House = { id: string; ownerId: string; x: number; y: number; door: Vec }
+export type House = { id: string; residents: string[]; x: number; y: number; door: Vec }
 export type Bush = { id: string; pos: Vec; berries: number; nextRegrow: number }
 export type Poi = { id: string; name: string; stand: Vec }
-export type Landmark = { name: string; center: Vec; radius: number; ownerId?: string }
+export type Landmark = { name: string; center: Vec; radius: number; houseId?: string }
+
+/** A shared, multi-session build that persists on the map. */
+export type Project = {
+  id: string
+  name: string
+  /** Top-left of the footprint, in tiles. */
+  pos: Vec
+  size: Vec
+  sessionsDone: number
+  sessionsNeeded: number
+  contributors: Record<string, number>
+  doneAt: number | null
+}
+
+/** The communal food store at the plaza. */
+export type Store = { pos: Vec; food: number; nextSpoil: number }
+
+/** What a villager's day job actually does in the world. */
+export type CraftKind = "build" | "cook" | "farm" | "forage" | "fish" | "keep_store" | "shrine" | "stories"
 
 export type Persona = {
   id: string
   name: string
+  vocation: string
+  craft: CraftKind
   blurb: string
-  traits: string[]
+  psyche: Psyche
   colors: { hair: string; skin: string; shirt: string; pants: string }
-  /** Multipliers on the base per-tick need decay. */
+  /** Multipliers on the base per-tick drain of bodily needs. */
   decay: Partial<Record<NeedKey, number>>
   start: Needs
 }
+
+/**
+ * What an action is "about", for measurement only. Never sent to JEV, never
+ * used to rank options. JEV's own motive readout is recorded separately.
+ */
+export type DriverKey =
+  | "body"
+  | "purpose"
+  | "building"
+  | "providing"
+  | "mastery"
+  | "belonging"
+  | "curiosity"
+  | "pleasure"
+  | "generosity"
+  | "security"
+  | "greed"
+  | "rest"
+
+export const PROSOCIAL_DRIVERS: DriverKey[] = ["building", "providing", "generosity"]
+export const ANTISOCIAL_DRIVERS: DriverKey[] = ["greed"]
 
 export type Intent =
   | { kind: "eat"; bushId: string }
@@ -44,8 +90,15 @@ export type Intent =
   | { kind: "campfire" }
   | { kind: "wander"; target: Vec }
   | { kind: "rest" }
+  | { kind: "work" }
+  | { kind: "build"; projectId: string }
+  | { kind: "gather"; bushId: string }
+  | { kind: "deposit" }
+  | { kind: "meal" }
+  | { kind: "take_store" }
+  | { kind: "eat_carry" }
 
-export type OptionSpec = { id: string; label: string; detail: string; intent: Intent }
+export type OptionSpec = { id: string; label: string; detail: string; intent: Intent; drivers: DriverKey[] }
 
 /** One status per agent is the single source of truth for what it is doing. */
 export type Status =
@@ -57,6 +110,7 @@ export type Status =
   | { kind: "considering"; askerId: string; resume: Status; since: number }
   | { kind: "chatting"; partnerId: string; ticksLeft: number }
   | { kind: "sleeping" }
+  | { kind: "collapsed"; ticksLeft: number }
 
 export type ChoiceMode = "sample" | "argmax"
 
@@ -69,31 +123,48 @@ export type DecisionRecord = {
   pickedLabel: string
   mode: ChoiceMode
   latencyMs: number
+  /** JEV's own readout of what drove the choice, and its confidence in the action. */
+  motive: { id: MotiveKey; p: number }[] | null
+  confidence: number | null
+  drivers: DriverKey[]
 }
 
 export type MemoryEntry = { tick: number; text: string }
 
-export type Flash = { kind: "heart" | "angry" | "exclaim" | "sweat"; until: number }
+export type Flash = { kind: "heart" | "angry" | "exclaim" | "sweat" | "eye" | "thanks"; until: number }
 
 export type Agent = {
   id: string
   persona: Persona
+  /** The living psyche: starts from the persona and can drift with experience. */
+  psyche: Psyche
   pos: Vec
   prev: Vec
   facing: Dir
   steps: number
   inside: boolean
   needs: Needs
+  needCause: Partial<Record<NeedKey, string>>
+  /** Food portions carried (berries or fish). */
+  carry: number
   status: Status
   memory: MemoryEntry[]
   affinity: Record<string, number>
   visited: Record<string, number>
   decisions: DecisionRecord[]
+  /** Chosen actions per driver tag (fractional when an action has several tags). */
+  drivers: Partial<Record<DriverKey, number>>
   mood: MoodReading | null
   flash: Flash | null
+  lastPurposeTick: number
 }
 
-export type LogEntry = { tick: number; text: string; agentIds: string[]; tone: "info" | "social" | "error" }
+export type LogEntry = {
+  tick: number
+  text: string
+  agentIds: string[]
+  tone: "info" | "social" | "error" | "conflict" | "good"
+}
 
 export type Stats = {
   calls: number
@@ -110,6 +181,8 @@ export type WorldConfig = { seed: number; scenario: string }
 export type Intervention =
   | { kind: "famine" }
   | { kind: "bounty" }
+  | { kind: "drain_store" }
+  | { kind: "fill_store" }
 
 export type World = {
   config: WorldConfig
@@ -125,6 +198,8 @@ export type World = {
   pois: Poi[]
   landmarks: Landmark[]
   campfire: Vec
+  project: Project
+  store: Store
   agents: Agent[]
   log: LogEntry[]
   stats: Stats

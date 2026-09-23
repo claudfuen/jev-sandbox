@@ -37,6 +37,7 @@ const concurrency = Number(flag("concurrency", "24"))
 const experiment = flag("experiment", "lab")!.toLowerCase().replace(/[^a-z0-9-]/g, "-")
 const condition = flag("condition", "baseline")!
 const upload = flag("upload") === "true"
+const assess = flag("assess") === "true"
 const verbose = flag("verbose") === "true"
 const interventions: { tick: number; intervention: Intervention }[] = (flag("intervene") ?? "")
   .split(",")
@@ -148,6 +149,62 @@ for (const def of METRICS) {
   console.log([def.id, ...cells].map((c) => c.padEnd(18)).join(""))
 }
 for (const r of records) console.log(`recorded ${r.meta.id}: ${r.events.length} events`)
+
+// Who did what: each villager's share of chosen actions by driver, from a replay of the record.
+const { ReplayCursor } = await import("@/lib/sim/session")
+const { digestRun } = await import("@/lib/sim/digest")
+for (const r of records) {
+  const cursor = new ReplayCursor(r)
+  cursor.seek(r.meta.endTick)
+  console.log(`\nvillagers, seed ${r.config.seed} (replay desyncs: ${cursor.desyncs}):`)
+  for (const a of cursor.world.agents) {
+    const total = Object.values(a.drivers).reduce((n, v) => n + (v ?? 0), 0) || 1
+    const top = Object.entries(a.drivers)
+      .sort((x, y) => (y[1] ?? 0) - (x[1] ?? 0))
+      .slice(0, 4)
+      .map(([k, v]) => `${k} ${Math.round(((v ?? 0) / total) * 100)}%`)
+      .join(", ")
+    const picks = new Map<string, number>()
+    for (const d of a.decisions) if (d.kind === "decide") picks.set(d.picked.replace(/_.*/, ""), (picks.get(d.picked.replace(/_.*/, "")) ?? 0) + 1)
+    const topPicks = [...picks.entries()].sort((x, y) => y[1] - x[1]).slice(0, 4).map(([k, n]) => `${k}x${n}`).join(" ")
+    console.log(`  ${a.persona.name.padEnd(8)} ${a.persona.vocation.slice(0, 18).padEnd(19)} ${top.padEnd(52)} ${topPicks}`)
+  }
+
+  if (assess) {
+    // JEV's estimate of whether this run is interesting to the owner. Advisory only.
+    const digest = digestRun(cursor.world, r.meta.title)
+    const ans = await runJev({ kind: "assess", payload: digest })
+    const level = (q: string) => {
+      const a = ans.answers[q]
+      return a?.type === "score" ? a.score : 0
+    }
+    const prob = (q: string) => {
+      const a = ans.answers[q]
+      return a?.type === "boolean" ? a.probability : 0
+    }
+    const pick = (q: string) => {
+      const a = ans.answers[q]
+      return a?.type === "choice" ? a.choice : ""
+    }
+    const INTEREST = ["boring", "mildly interesting", "interesting", "very interesting", "fascinating"]
+    const DISTINCT = ["all the same", "slightly different", "clearly different", "very distinct", "vivid individuals"]
+    const SOCIETY = ["no society", "a crowd", "some social structure", "a real community", "a complex society"]
+    r.meta.assessment = {
+      interest: INTEREST[Math.round(level("interest"))],
+      interestScore: level("interest"),
+      surprise: prob("surprise"),
+      distinct: DISTINCT[Math.round(level("distinct"))],
+      society: SOCIETY[Math.round(level("society"))],
+      story: prob("story"),
+      missing: pick("missing"),
+      best: pick("best"),
+    }
+    const m = r.meta.assessment
+    console.log(
+      `\nJEV assessment (advisory): ${m.interest} (${m.interestScore.toFixed(2)}/4), villagers ${m.distinct}, ${m.society}, surprise p=${m.surprise.toFixed(2)}, story p=${m.story.toFixed(2)}\n  best part: ${m.best}; most missing: ${m.missing}`,
+    )
+  }
+}
 
 if (upload) {
   for (const r of records) await saveRun(r)

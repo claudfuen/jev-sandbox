@@ -24,11 +24,14 @@ const perHour = (v: number) => `${v.toFixed(1)}/h`
 /** The default dashboard, shared by the live view and replays. */
 export const DEFAULT_STRIPS: StripSpec[] = [
   { id: "wellbeing", label: "Wellbeing", format: whole },
-  { id: "distress", label: "Distress", format: whole },
+  { id: "purpose", label: "Purpose", format: whole },
+  { id: "respect", label: "Respect", format: whole },
+  { id: "store_food", label: "Food in the store", format: whole },
+  { id: "granary", label: "Granary built", format: pct },
+  { id: "prosocial_share", label: "Prosocial choices", format: pct },
+  { id: "thefts", label: "Takings outside mealtime", format: whole },
   { id: "friendship_density", label: "Friendship density", format: pct },
-  { id: "acceptance_rate", label: "Chat acceptance", format: pct },
   { id: "chats", label: "Chats per hour", mode: "rate", format: perHour },
-  { id: "declines", label: "Declines per hour", mode: "rate", format: perHour },
 ]
 
 /** Turn samples into the plotted series: raw levels, or per-hour deltas of a count. */

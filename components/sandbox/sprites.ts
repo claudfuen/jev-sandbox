@@ -37,7 +37,23 @@ export const PAL = {
   stoneDark: "#7a7a86",
   berry: "#e2383c",
   berryLight: "#ff9a9a",
+  berryDark: "#a82230",
   white: "#ffffff",
+  // Granary thatch and planks: warm yellows and browns, kept apart from the red house roofs.
+  thatch: "#e8c25a",
+  thatchLight: "#f6de8e",
+  thatchShade: "#c49232",
+  thatchDark: "#a8791e",
+  thatchDarker: "#8c6218",
+  thatchDeep: "#7a5418",
+  plank: "#c48a4e",
+  plankLight: "#dcaa6c",
+  plankDark: "#9a6434",
+  straw: "#e8c47e",
+  // Progress bars: dark track, bright fill.
+  barTrack: "#3b4252",
+  barFill: "#58d858",
+  barLight: "#a8f0a0",
 } as const
 
 /** Paint a character map. `flip` mirrors horizontally. "." is transparent. */
@@ -344,6 +360,328 @@ export function drawHouse(ctx: Ctx, px: number, py: number, lit: boolean, night:
 }
 
 // ---------------------------------------------------------------------------
+// Village granary (3x2 tiles), its construction site, the communal store and carried berries
+
+function clamp01(v: number): number {
+  return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0
+}
+
+// Survey stake with a red ribbon; the bottom row is the foot.
+const STAKE: PixelMap = [".k.", "krk", "kwk", "kwk", "kdk", "kdk", ".k."]
+
+// Round wooden plaque with a berry, hung in the granary gable.
+const GRANARY_EMBLEM: PixelMap = [
+  ".kkkkkkkk.",
+  "kccccccgck",
+  "kcccccgcck",
+  "kcclrrrcck",
+  "kcrrrrrrck",
+  "kcrrrrrrck",
+  "kccrrrrcck",
+  ".kkkkkkkk.",
+]
+
+const GRANARY_W = 48
+
+/** Rows the gable roof drops at column x: the peak faces the viewer, stepping 3 px per row. */
+function gableDrop(x: number): number {
+  return Math.floor(Math.abs(x - (GRANARY_W - 1) / 2) / 3)
+}
+
+function drawPlanks(ctx: Ctx, x: number, y: number, count: number) {
+  // Bottom plank first so each board above shares the outline below it.
+  for (let k = 0; k < count; k++) {
+    const bx = x + (k % 2)
+    const by = y - k * 2
+    ctx.fillStyle = PAL.outline
+    ctx.fillRect(bx, by, 14, 3)
+    ctx.fillStyle = PAL.plankLight
+    ctx.fillRect(bx + 1, by + 1, 12, 1)
+    ctx.fillStyle = PAL.plankDark
+    ctx.fillRect(bx + 12, by + 1, 1, 1)
+  }
+}
+
+function drawProgressBar(ctx: Ctx, x: number, y: number, w: number, progress: number) {
+  ctx.fillStyle = PAL.outline
+  ctx.fillRect(x, y, w, 4)
+  ctx.fillStyle = PAL.barTrack
+  ctx.fillRect(x + 1, y + 1, w - 2, 2)
+  const fill = Math.round(clamp01(progress) * (w - 2))
+  if (fill <= 0) return
+  ctx.fillStyle = PAL.barFill
+  ctx.fillRect(x + 1, y + 1, fill, 2)
+  ctx.fillStyle = PAL.barLight
+  ctx.fillRect(x + 1, y + 1, fill, 1)
+}
+
+/**
+ * A 48x32 granary under construction. `progress` (0..1) raises the timber frame: posts first,
+ * then the top plate, then the rafters up to the ridge. At 0 it is a staked plot with planks.
+ */
+export function drawGranarySite(ctx: Ctx, px: number, py: number, progress: number) {
+  const p = clamp01(progress)
+  // Trampled dirt plot with a darker rim.
+  ctx.fillStyle = PAL.pathDark
+  ctx.fillRect(px + 3, py + 8, 42, 18)
+  ctx.fillRect(px + 4, py + 7, 40, 20)
+  ctx.fillStyle = PAL.path
+  ctx.fillRect(px + 4, py + 8, 40, 18)
+  for (let i = 0; i < 10; i++) {
+    ctx.fillStyle = i % 2 ? PAL.pathLight : PAL.pathDark
+    ctx.fillRect(px + 5 + Math.floor(hash(i, 3, 17) * 37), py + 9 + Math.floor(hash(i, 5, 19) * 15), 1, 1)
+  }
+  // Survey string, dotted between the corner stakes.
+  ctx.fillStyle = PAL.white
+  for (let x = 5; x <= 42; x += 2) {
+    ctx.fillRect(px + x, py + 7, 1, 1)
+    ctx.fillRect(px + x, py + 26, 1, 1)
+  }
+  for (let y = 9; y <= 24; y += 2) {
+    ctx.fillRect(px + 3, py + y, 1, 1)
+    ctx.fillRect(px + 44, py + y, 1, 1)
+  }
+  const stakeColors = { k: PAL.outline, r: "#e8384c", w: PAL.plankLight, d: PAL.wood }
+  paint(ctx, STAKE, stakeColors, px + 2, py + 1)
+  paint(ctx, STAKE, stakeColors, px + 43, py + 1)
+
+  // Timber frame. Posts rise over the first 60%, rafters close the gable over the rest.
+  const wallP = clamp01(p / 0.6)
+  const roofP = clamp01((p - 0.6) / 0.4)
+  const postH = Math.round(wallP * 14)
+  const timber = (x: number, y: number, w: number, h: number, vertical: boolean) => {
+    ctx.fillStyle = PAL.woodDark
+    ctx.fillRect(x, y, w, h)
+    ctx.fillStyle = PAL.wood
+    if (vertical) ctx.fillRect(x, y, 1, h)
+    else ctx.fillRect(x, y, w, 1)
+  }
+  if (p > 0) timber(px + 5, py + 23, 38, 2, false)
+  if (postH > 0) {
+    for (const x of [6, 16, 30, 40]) timber(px + x, py + 23 - postH, 2, postH, true)
+  }
+  if (wallP >= 1) {
+    timber(px + 5, py + 8, 38, 2, false)
+    // Diagonal braces across the outer bays.
+    ctx.fillStyle = PAL.woodDark
+    for (let i = 0; i < 13; i++) {
+      const dx = Math.floor((i * 7) / 12)
+      ctx.fillRect(px + 8 + dx, py + 22 - i, 1, 1)
+      ctx.fillRect(px + 39 - dx, py + 22 - i, 1, 1)
+    }
+  }
+  const rafterLen = Math.round(roofP * 20)
+  for (let i = 0; i < rafterLen; i++) {
+    const y = py + 8 - Math.floor((i * 7) / 19)
+    for (const x of [px + 4 + i, px + 43 - i]) {
+      ctx.fillStyle = PAL.wood
+      ctx.fillRect(x, y - 1, 1, 1)
+      ctx.fillStyle = PAL.woodDark
+      ctx.fillRect(x, y, 1, 1)
+    }
+  }
+  if (roofP >= 1) timber(px + 23, py + 2, 2, 6, true)
+
+  // Ladder against the frame once there is something to climb.
+  if (postH >= 6) {
+    const top = Math.max(8, 22 - postH)
+    ctx.fillStyle = PAL.woodDark
+    ctx.fillRect(px + 25, py + top, 1, 27 - top)
+    ctx.fillRect(px + 29, py + top, 1, 27 - top)
+    ctx.fillStyle = PAL.plankLight
+    for (let y = top + 1; y < 26; y += 3) ctx.fillRect(px + 26, py + y, 3, 1)
+  }
+
+  // Stock of planks, used up as the frame goes up; front stakes stand in front of everything.
+  drawPlanks(ctx, px + 7, py + 23, Math.max(1, 3 - Math.floor(p * 3)))
+  paint(ctx, STAKE, stakeColors, px + 2, py + 20)
+  paint(ctx, STAKE, stakeColors, px + 43, py + 20)
+
+  drawProgressBar(ctx, px + 4, py + 28, 40, p)
+}
+
+/** The finished 48x32 granary: thatched gable roof, plank walls on a stone footing, double door. */
+export function drawGranary(ctx: Ctx, px: number, py: number) {
+  // Front wall.
+  ctx.fillStyle = PAL.outline
+  ctx.fillRect(px + 2, py + 12, 44, 20)
+  ctx.fillStyle = PAL.plank
+  ctx.fillRect(px + 3, py + 12, 42, 16)
+  ctx.fillStyle = PAL.plankDark
+  for (const x of [5, 9, 13, 34, 38, 42]) ctx.fillRect(px + x, py + 12, 1, 16)
+  ctx.fillStyle = PAL.plankLight
+  for (const x of [6, 10, 14, 35, 39, 43]) ctx.fillRect(px + x, py + 12, 1, 16)
+  // Stone footing.
+  ctx.fillStyle = PAL.stone
+  ctx.fillRect(px + 3, py + 28, 42, 3)
+  ctx.fillStyle = PAL.stoneDark
+  ctx.fillRect(px + 3, py + 30, 42, 1)
+  for (const x of [8, 14, 33, 39]) ctx.fillRect(px + x, py + 28, 1, 2)
+  ctx.fillStyle = PAL.white
+  for (const x of [4, 10, 35, 41]) ctx.fillRect(px + x, py + 28, 2, 1)
+
+  // Thatched gable roof, lit from the left, courses running parallel to the eave.
+  for (let x = 0; x < GRANARY_W; x++) {
+    const top = gableDrop(x)
+    const edge = 12 + top
+    if (x >= 3 && x <= 44) {
+      ctx.fillStyle = PAL.plankDark
+      ctx.fillRect(px + x, py + edge + 1, 1, 1)
+    }
+    ctx.fillStyle = PAL.outline
+    ctx.fillRect(px + x, py + top, 1, edge - top + 1)
+    if (x === 0 || x === GRANARY_W - 1) continue
+    const lit = x < GRANARY_W / 2
+    ctx.fillStyle = lit ? PAL.thatch : PAL.thatchShade
+    ctx.fillRect(px + x, py + top + 1, 1, edge - top - 2)
+    for (let y = edge - 4; y > top; y -= 3) {
+      ctx.fillStyle = lit ? PAL.thatchDark : PAL.thatchDarker
+      ctx.fillRect(px + x, py + y, 1, 1)
+      if ((x + y) % 4 === 0) {
+        ctx.fillStyle = lit ? PAL.thatchLight : PAL.thatch
+        ctx.fillRect(px + x, py + y - 1, 1, 1)
+      }
+    }
+    ctx.fillStyle = PAL.thatchDeep
+    ctx.fillRect(px + x, py + edge - 1, 1, 1)
+    if (x % 2 === 0) {
+      // Ragged straw fringe hanging over the wall.
+      ctx.fillStyle = PAL.thatchDark
+      ctx.fillRect(px + x, py + edge, 1, 1)
+      ctx.fillStyle = PAL.outline
+      ctx.fillRect(px + x, py + edge + 1, 1, 1)
+    }
+  }
+  // Ridge cap with straw bindings.
+  ctx.fillStyle = PAL.thatchDeep
+  ctx.fillRect(px + 23, py + 1, 2, 10)
+  ctx.fillStyle = PAL.thatchLight
+  for (let y = 2; y < 11; y += 3) ctx.fillRect(px + 23, py + y, 1, 1)
+
+  // Berry plaque in the gable.
+  paint(
+    ctx,
+    GRANARY_EMBLEM,
+    { k: PAL.woodDark, c: PAL.wall, r: PAL.berry, l: PAL.berryLight, g: "#3f9a45" },
+    px + 19,
+    py + 11,
+  )
+
+  // Plank double door with a latch bar across the seam.
+  ctx.fillStyle = PAL.woodDark
+  ctx.fillRect(px + 18, py + 20, 12, 12)
+  ctx.fillStyle = PAL.wood
+  ctx.fillRect(px + 19, py + 21, 10, 11)
+  ctx.fillStyle = PAL.woodDark
+  ctx.fillRect(px + 23, py + 21, 2, 11)
+  ctx.fillRect(px + 21, py + 21, 1, 11)
+  ctx.fillRect(px + 26, py + 21, 1, 11)
+  ctx.fillStyle = PAL.plankLight
+  ctx.fillRect(px + 19, py + 21, 4, 1)
+  ctx.fillRect(px + 25, py + 21, 4, 1)
+  ctx.fillRect(px + 20, py + 25, 8, 2)
+  ctx.fillStyle = PAL.plankDark
+  ctx.fillRect(px + 20, py + 26, 8, 1)
+}
+
+// 16x16 woven basket on a little stand; berries heap in the opening.
+const BASKET: PixelMap = [
+  "................",
+  "................",
+  "................",
+  "................",
+  "..kkkkkkkkkkkk..",
+  ".kllllllllllllk.",
+  "kliiiiiiiiiiiilk",
+  "kliiiiiiiiiiiilk",
+  "kllllllllllllllk",
+  "kddddddddddddddk",
+  ".kwwvwwwvwwwvwk.",
+  ".kvwwwvwwwvwwwk.",
+  ".kwwvwwwvwwwvwk.",
+  "..kkkkkkkkkkkk..",
+  "..kt........tk..",
+  "..kt........tk..",
+]
+// Fill order: the bottom row fills the opening from the centre out, then the heap grows.
+const STORE_SPOTS: readonly (readonly [number, number])[] = [
+  [6, 6],
+  [8, 6],
+  [4, 6],
+  [10, 6],
+  [2, 6],
+  [12, 6],
+  [6, 4],
+  [8, 4],
+  [4, 4],
+  [10, 4],
+  [6, 2],
+  [8, 2],
+]
+
+/** Communal village store: shows up to 12 berries; an empty basket at 0. */
+export function drawStoreBasket(ctx: Ctx, px: number, py: number, berries: number) {
+  ctx.fillStyle = "rgba(0,0,0,0.22)"
+  ctx.fillRect(px + 2, py + 14, 12, 2)
+  paint(
+    ctx,
+    BASKET,
+    { k: PAL.outline, l: PAL.straw, i: PAL.woodDark, d: PAL.wood, w: PAL.plankLight, v: PAL.plankDark, t: PAL.wood },
+    px,
+    py,
+  )
+  const n = Number.isFinite(berries) ? Math.max(0, Math.min(STORE_SPOTS.length, Math.floor(berries))) : 0
+  for (let i = 0; i < n; i++) {
+    const [bx, by] = STORE_SPOTS[i]
+    ctx.fillStyle = PAL.berry
+    ctx.fillRect(px + bx, py + by, 2, 2)
+    ctx.fillStyle = PAL.berryLight
+    ctx.fillRect(px + bx, py + by, 1, 1)
+    ctx.fillStyle = PAL.berryDark
+    ctx.fillRect(px + bx + 1, py + by + 1, 1, 1)
+  }
+}
+
+// Berry clusters for 1 to 4 carried berries, inside a 6x6 box (outline included).
+const CARRY_LAYOUTS: readonly (readonly (readonly [number, number])[])[] = [
+  [],
+  [[2, 3]],
+  [
+    [1, 3],
+    [3, 3],
+  ],
+  [
+    [1, 3],
+    [3, 3],
+    [2, 1],
+  ],
+  [
+    [1, 3],
+    [3, 3],
+    [1, 1],
+    [3, 1],
+  ],
+]
+
+/** Berries held in a character's hand; (px, py) is the top-left of a 6x6 box. Draws 1 to 4, none at 0. */
+export function drawCarry(ctx: Ctx, px: number, py: number, n: number) {
+  const count = Number.isFinite(n) ? Math.max(0, Math.min(4, Math.floor(n))) : 0
+  const spots = CARRY_LAYOUTS[count]
+  // One shared outline so the cluster reads against any shirt colour.
+  ctx.fillStyle = PAL.outline
+  for (const [bx, by] of spots) {
+    ctx.fillRect(px + bx - 1, py + by, 4, 2)
+    ctx.fillRect(px + bx, py + by - 1, 2, 4)
+  }
+  for (const [bx, by] of spots) {
+    ctx.fillStyle = PAL.berry
+    ctx.fillRect(px + bx, py + by, 2, 2)
+    ctx.fillStyle = PAL.berryLight
+    ctx.fillRect(px + bx, py + by, 1, 1)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Characters: 16x16, 2-frame walk, left is a mirrored right.
 
 const FRONT: PixelMap = [
@@ -446,7 +784,26 @@ export function drawCharacter(
 // ---------------------------------------------------------------------------
 // Emote bubbles (drawn above heads)
 
-export type EmoteKind = "dots" | "heart" | "zzz" | "exclaim" | "question" | "angry" | "berry" | "drop" | "note" | "sparkle" | "sweat" | "fire"
+export type EmoteKind =
+  | "dots"
+  | "heart"
+  | "zzz"
+  | "exclaim"
+  | "question"
+  | "angry"
+  | "berry"
+  | "drop"
+  | "note"
+  | "sparkle"
+  | "sweat"
+  | "fire"
+  | "hammer"
+  | "coin"
+  | "gift"
+  | "eye"
+  | "thought"
+  | "sad"
+  | "thanks"
 
 const ICONS: Record<EmoteKind, { map: PixelMap; colors: Record<string, string> }> = {
   dots: { map: [".......", ".......", ".......", "a.a.a..", ".......", "......."], colors: { a: PAL.outline } },
@@ -461,6 +818,34 @@ const ICONS: Record<EmoteKind, { map: PixelMap; colors: Record<string, string> }
   sparkle: { map: ["...y...", "...y...", "yyyyyyy", "...y...", "...y...", "......."], colors: { y: "#f5a623" } },
   sweat: { map: [".....b.", "....bb.", "...bbb.", "...bbb.", "....b..", "......."], colors: { b: "#3c86d0" } },
   fire: { map: ["...o...", "..ooo..", ".oyoyo.", ".oyyyo.", "..ooo..", "......."], colors: { o: "#f8902c", y: "#ffe066" } },
+  hammer: {
+    map: ["sslsss.", ".sssss.", "...w...", "...w...", "...w...", "...d..."],
+    colors: { s: PAL.stoneDark, l: PAL.stone, w: PAL.wood, d: PAL.woodDark },
+  },
+  coin: {
+    map: ["..ooo..", ".owyyo.", ".oydyo.", ".oydyo.", ".oyyyo.", "..ooo.."],
+    colors: { o: "#c8841c", y: "#ffd866", d: "#c8841c", w: PAL.white },
+  },
+  gift: {
+    map: [".rr.rr.", "..rrr..", "bbbrbbb", ".bbrbb.", ".bbrbb.", ".ddrdd."],
+    colors: { r: "#f5a623", b: "#4a6ad8", d: "#2f4aa8" },
+  },
+  eye: {
+    map: ["..kkk..", ".kwbwk.", "kwbpbwk", ".kwbwk.", "..kkk..", "......."],
+    colors: { k: PAL.outline, w: PAL.white, b: "#4a6ad8", p: PAL.outline },
+  },
+  thought: {
+    map: ["..c.cc.", ".ccwccc", "ccccccc", ".ccccc.", ".......", "c......"],
+    colors: { c: "#7a88c8", w: PAL.white },
+  },
+  sad: {
+    map: [".ooooo.", "oykykyo", "oybyyyo", "oykkkyo", "okyyyko", ".ooooo."],
+    colors: { o: "#f5a623", y: "#ffe066", k: PAL.outline, b: "#3c86d0" },
+  },
+  thanks: {
+    map: [".pp.pp.", "pwppppp", ".ppppp.", "s.ppp.s", "ss.p.ss", ".sssss."],
+    colors: { p: "#f25f8f", w: PAL.white, s: "#e0a070" },
+  },
 }
 
 export function drawBubble(ctx: Ctx, kind: EmoteKind, px: number, py: number) {
@@ -486,5 +871,8 @@ export const PIXEL_MAPS: Record<string, { map: PixelMap; width: number }> = {
   BACK: { map: BACK, width: 16 },
   SIDE: { map: SIDE, width: 16 },
   WALK: { map: [...WALK_FRONT.flat(), ...WALK_SIDE.flat()], width: 16 },
+  BASKET: { map: BASKET, width: 16 },
+  STAKE: { map: STAKE, width: 3 },
+  GRANARY_EMBLEM: { map: GRANARY_EMBLEM, width: 10 },
   ...Object.fromEntries(Object.entries(ICONS).map(([k, v]) => [`ICON_${k}`, { map: v.map, width: 7 }])),
 }

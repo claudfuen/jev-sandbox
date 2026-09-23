@@ -40,6 +40,19 @@ export type RunMeta = {
   population: number
   /** Final metric values, so the gallery can compare conditions without loading full records. */
   final?: Record<string, number>
+  /** JEV's estimate of how interesting the run is to the owner. Advisory only. */
+  assessment?: Assessment
+}
+
+export type Assessment = {
+  interest: string
+  interestScore: number
+  surprise: number
+  distinct: string
+  society: string
+  story: number
+  missing: string
+  best: string
 }
 
 export type RunRecord = {

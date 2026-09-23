@@ -5,21 +5,16 @@ import { cn } from "cn"
 
 import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { needWord } from "@/lib/jev/prompt"
-import { MOOD_LEVELS, NEED_KEYS, type NeedKey } from "@/lib/jev/schema"
+import { NEED_NAMES, needWord } from "@/lib/jev/prompt"
+import { MOOD_LEVELS, MOTIVES, NEED_KEYS, type NeedKey } from "@/lib/jev/schema"
 import { formatTime } from "@/lib/sim/clock"
 import { describeLocation, describeStatus } from "@/lib/sim/engine"
+import { FOUNDATION_KEYS, psycheLines, VALUE_KEYS } from "@/lib/sim/psyche"
 import type { Agent, Persona, World } from "@/lib/sim/types"
 
 import { drawCharacter } from "./sprites"
 
-const NEED_LABEL: Record<NeedKey, string> = {
-  hunger: "Hunger",
-  thirst: "Thirst",
-  energy: "Energy",
-  social: "Social",
-  fun: "Fun",
-}
+const NEED_LABEL: Record<NeedKey, string> = NEED_NAMES
 
 export function Avatar({ persona, size = 32 }: { persona: Persona; size?: number }) {
   const ref = useRef<HTMLCanvasElement>(null)
@@ -80,9 +75,11 @@ function AgentHeader({ agent, world }: { world: World; agent: Agent }) {
         <div className="flex min-w-0 flex-col gap-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-base font-semibold">{agent.persona.name}</h2>
+            <span className="text-xs text-muted-foreground">{agent.persona.vocation}</span>
             {agent.mood && <Badge variant="secondary">feeling {agent.mood.label}</Badge>}
+            {agent.carry > 0 && <Badge variant="outline">carrying {agent.carry} food</Badge>}
           </div>
-          <p className="text-[13px] leading-snug text-muted-foreground">{agent.persona.blurb.replace(/^You are /, "")}</p>
+          <p className="text-[13px] leading-snug text-muted-foreground">{agent.persona.blurb}</p>
         </div>
       </div>
       <div className="rounded-lg border bg-muted/40 px-3 py-2 text-sm">
@@ -101,7 +98,7 @@ function MindTab({ agent }: { agent: Agent }) {
       <Section title="Needs">
         <div className="grid grid-cols-[4.5rem_1fr_6.5rem] items-center gap-x-3 gap-y-2 text-sm">
           {NEED_KEYS.map((k) => (
-            <div key={k} className="contents">
+            <div key={k} className="contents" title={agent.needCause[k] ?? ""}>
               <span className="text-muted-foreground">{NEED_LABEL[k]}</span>
               <Meter value={agent.needs[k]} />
               <span className="truncate text-xs text-muted-foreground tabular-nums">
@@ -137,6 +134,23 @@ function MindTab({ agent }: { agent: Agent }) {
                 </div>
               )
             })}
+            {last.motive && (
+              <div className="mt-2 flex flex-col gap-1.5 border-t pt-2">
+                <div className="flex items-baseline justify-between text-xs text-muted-foreground">
+                  <span>What JEV says is driving them</span>
+                  {last.confidence !== null && <span className="tabular-nums">confidence {Math.round(last.confidence * 100)}%</span>}
+                </div>
+                {last.motive.slice(0, 4).map((m, i) => (
+                  <div key={m.id} className="grid grid-cols-[1fr_6rem_2.5rem] items-center gap-3 text-sm">
+                    <span className={cn("truncate", i === 0 ? "font-medium" : "text-muted-foreground")} title={MOTIVES[m.id]}>
+                      {m.id}
+                    </span>
+                    <Meter value={m.p * 100} tone={i === 0 ? "picked" : "muted"} />
+                    <span className="text-right text-xs text-muted-foreground tabular-nums">{Math.round(m.p * 100)}%</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           <p className="text-sm text-muted-foreground">Waiting for the first decision.</p>
@@ -184,14 +198,86 @@ function RelationsTab({ world, agent }: { world: World; agent: Agent }) {
             })}
         </div>
       </Section>
-      <Section title="Traits">
+    </div>
+  )
+}
+
+
+const TRAIT_LABELS = [
+  ["openness", "Openness"],
+  ["conscientiousness", "Conscientiousness"],
+  ["extraversion", "Extraversion"],
+  ["agreeableness", "Agreeableness"],
+  ["neuroticism", "Neuroticism"],
+] as const
+
+function PsycheTab({ agent }: { agent: Agent }) {
+  const p = agent.psyche
+  const topValues = [...VALUE_KEYS].sort((a, b) => p.values[b] - p.values[a]).slice(0, 4)
+  const strongFoundations = FOUNDATION_KEYS.filter((k) => p.foundations[k] >= 65 || p.foundations[k] <= 30)
+  const drivers = Object.entries(agent.drivers).sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+  const totalDrivers = drivers.reduce((n, [, v]) => n + (v ?? 0), 0)
+  return (
+    <div className="flex flex-col gap-5">
+      <Section title="Who they are, as JEV reads it">
+        <ul className="flex flex-col gap-1.5 rounded-lg border bg-muted/40 p-3 text-[13px] leading-snug">
+          {psycheLines(p).map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      </Section>
+      <Section title="Temperament">
+        <div className="grid grid-cols-[8.5rem_1fr_2rem] items-center gap-x-3 gap-y-1.5 text-sm">
+          {TRAIT_LABELS.map(([k, label]) => (
+            <div key={k} className="contents">
+              <span className="text-muted-foreground">{label}</span>
+              <Meter value={p.big5[k]} tone="muted" />
+              <span className="text-right text-xs text-muted-foreground tabular-nums">{p.big5[k]}</span>
+            </div>
+          ))}
+          <div className="contents">
+            <span className="text-muted-foreground">Trust in others</span>
+            <Meter value={p.trust} tone="muted" />
+            <span className="text-right text-xs text-muted-foreground tabular-nums">{p.trust}</span>
+          </div>
+        </div>
+      </Section>
+      <Section title="Values and moral instincts">
         <div className="flex flex-wrap gap-1">
-          {agent.persona.traits.map((t) => (
-            <Badge key={t} variant="outline">
-              {t}
+          {topValues.map((k) => (
+            <Badge key={k} variant="secondary">
+              {k} {p.values[k]}
             </Badge>
           ))}
+          {strongFoundations.map((k) => (
+            <Badge key={k} variant="outline">
+              {p.foundations[k] >= 65 ? "strong" : "weak"} {k}
+            </Badge>
+          ))}
+          <Badge variant="outline">{p.attachment} attachment</Badge>
+          {(["machiavellianism", "narcissism", "psychopathy"] as const)
+            .filter((k) => p.dark[k] >= 45)
+            .map((k) => (
+              <Badge key={k} variant="destructive">
+                {k} {p.dark[k]}
+              </Badge>
+            ))}
         </div>
+      </Section>
+      <Section title="What their choices were about" aside={<span className="text-xs text-muted-foreground">tagged by the engine</span>}>
+        {drivers.length ? (
+          <div className="grid grid-cols-[6.5rem_1fr_2.5rem] items-center gap-x-3 gap-y-1.5 text-sm">
+            {drivers.map(([k, v]) => (
+              <div key={k} className="contents">
+                <span className="text-muted-foreground">{k}</span>
+                <Meter value={((v ?? 0) / Math.max(1e-9, totalDrivers)) * 100} tone="muted" />
+                <span className="text-right text-xs text-muted-foreground tabular-nums">{Math.round(((v ?? 0) / totalDrivers) * 100)}%</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">No choices yet.</p>
+        )}
       </Section>
     </div>
   )
@@ -257,7 +343,7 @@ export function InspectorPanel({
   const selected = world.agents.find((a) => a.id === selectedId) ?? world.agents[0]
   return (
     <aside className="flex min-h-[600px] min-w-0 flex-col overflow-hidden rounded-xl border bg-card lg:min-h-0">
-      <div className="grid shrink-0 grid-cols-4 gap-1 border-b p-2" role="tablist" aria-label="Villagers">
+      <div className="grid shrink-0 grid-cols-5 gap-1 border-b p-2" role="tablist" aria-label="Villagers">
         {world.agents.map((a) => (
           <button
             key={a.id}
@@ -280,12 +366,16 @@ export function InspectorPanel({
       <Tabs defaultValue="mind" className="min-h-0 flex-1 gap-0">
         <TabsList variant="line" className="w-full shrink-0 justify-start border-b px-2">
           <TabsTrigger value="mind">Mind</TabsTrigger>
+          <TabsTrigger value="psyche">Psyche</TabsTrigger>
           <TabsTrigger value="relations">Relations</TabsTrigger>
           <TabsTrigger value="memory">Memory</TabsTrigger>
           <TabsTrigger value="jev">JEV input</TabsTrigger>
         </TabsList>
         <TabsContent value="mind" className="min-h-0 overflow-y-auto p-3">
           <MindTab agent={selected} />
+        </TabsContent>
+        <TabsContent value="psyche" className="min-h-0 overflow-y-auto p-3">
+          <PsycheTab agent={selected} />
         </TabsContent>
         <TabsContent value="relations" className="min-h-0 overflow-y-auto p-3">
           <RelationsTab world={world} agent={selected} />
@@ -313,7 +403,14 @@ export function VillageLog({ world }: { world: World }) {
         {[...world.log].reverse().map((l, i) => (
           <li key={`${l.tick}-${i}`} className="grid grid-cols-[4.5rem_1fr] gap-2 py-px">
             <span className="text-muted-foreground tabular-nums">{formatTime(l.tick)}</span>
-            <span className={cn(l.tone === "error" && "text-destructive", l.tone === "social" && "text-sky-600 dark:text-sky-400")}>
+            <span
+              className={cn(
+                l.tone === "error" && "text-destructive",
+                l.tone === "social" && "text-sky-600 dark:text-sky-400",
+                l.tone === "conflict" && "text-amber-600 dark:text-amber-400",
+                l.tone === "good" && "text-emerald-600 dark:text-emerald-400",
+              )}
+            >
               {l.text}
             </span>
           </li>

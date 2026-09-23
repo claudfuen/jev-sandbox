@@ -5,7 +5,8 @@ import { createWorld, perceive, buildOptions, step, type SimRequest } from "@/li
 import { findPath } from "@/lib/sim/geometry"
 import { isWalkable, MAP_H, MAP_W } from "@/lib/sim/map"
 import { ReplayCursor, Session } from "@/lib/sim/session"
-import type { JevAnswer } from "@/lib/jev/schema"
+import { jevRequestSchema, type JevAnswer } from "@/lib/jev/schema"
+import { toWire } from "@/lib/sim/engine"
 
 describe("pixel maps", () => {
   for (const [name, { map, width }] of Object.entries(PIXEL_MAPS)) {
@@ -25,7 +26,7 @@ describe("world", () => {
         expect(findPath(world.tiles, agent.pos, (p) => p.x === poi.stand.x && p.y === poi.stand.y)).not.toBeNull()
       }
       const options = buildOptions(world, agent)
-      for (const id of ["eat", "drink", "sleep", "campfire", "rest"]) {
+      for (const id of ["eat", "drink", "sleep", "campfire", "rest", "build", "take_store"]) {
         expect(options.some((o) => o.id === id)).toBe(true)
       }
     }
@@ -44,7 +45,8 @@ describe("world", () => {
     const reqs = step(w)
     expect(reqs).toHaveLength(w.agents.length)
     for (const r of reqs) expect(r.perception.noticing.length).toBeGreaterThan(0)
-    expect(perceive(w, w.agents[0]).name).toBe("Pip")
+    expect(perceive(w, w.agents[0]).name).toBe("Wren")
+    expect(perceive(w, w.agents[0]).psyche.length).toBeGreaterThan(2)
   })
 
   test("map is fully bordered", () => {
@@ -64,7 +66,8 @@ function fakeAnswer(req: SimRequest): JevAnswer {
     const total = weights.reduce((a, b) => a + b, 0)
     const probabilities = Object.fromEntries(req.options.map((o, i) => [o.id, weights[i] / total]))
     const choice = req.options[weights.indexOf(Math.max(...weights))].id
-    return { kind: "decide", state: "", answers: { action: { type: "choice", choice, probabilities }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
+    const motive = { type: "choice" as const, choice: "purpose", probabilities: { purpose: 0.6, gain: 0.4 } }
+    return { kind: "decide", state: "", answers: { action: { type: "choice", choice, probabilities }, mood, motive }, confidence: { action: 0.5 }, latencyMs: 300, costUsd: 0.00002 }
   }
   return { kind: "respond", state: "", answers: { engage: { type: "boolean", probability: h(3) }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
 }
@@ -108,6 +111,40 @@ describe("record and replay", () => {
     const cursor = new ReplayCursor(record)
     cursor.seek(1)
     const d = cursor.world.agents[0].decisions.at(-1)!
-    expect(d.state).toContain("You are Pip")
+    expect(d.state).toContain("You are Wren")
+    expect(d.state).toContain("Who you are:")
+  })
+})
+
+describe("psychology", () => {
+  test("different psyches render into different first-person lines", async () => {
+    const { PERSONAS } = await import("@/lib/sim/personas")
+    const { psycheLines } = await import("@/lib/sim/psyche")
+    const sable = psycheLines(PERSONAS.find((p) => p.id === "sable")!.psyche).join(" ")
+    const mo = psycheLines(PERSONAS.find((p) => p.id === "mo")!.psyche).join(" ")
+    expect(sable).toContain("deceive")
+    expect(mo).not.toContain("deceive")
+    expect(mo).toContain("caring for the people close to you")
+  })
+
+  test("everyone has a house and there are ten founders", () => {
+    const w = createWorld()
+    expect(w.agents).toHaveLength(10)
+    for (const a of w.agents) expect(w.houses.some((h) => h.residents.includes(a.id))).toBe(true)
+  })
+})
+
+describe("wire contract", () => {
+  test("every request a long stub run produces passes the public route's schema", () => {
+    const session = new Session({ seed: 5 })
+    const failures: string[] = []
+    for (let t = 0; t < 400; t++) {
+      for (const req of session.tick()) {
+        const res = jevRequestSchema.safeParse(toWire(session.world, req))
+        if (!res.success) failures.push(res.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "))
+        session.answer(req.id, fakeAnswer(req), "sample")
+      }
+    }
+    expect(failures.slice(0, 3)).toEqual([])
   })
 })

@@ -12,14 +12,18 @@ import {
   drawBubble,
   drawBush,
   drawCampfire,
+  drawCarry,
   drawCharacter,
   drawFlowers,
+  drawGranary,
+  drawGranarySite,
   drawGrass,
   drawHouse,
   drawPath,
   drawRock,
   drawSand,
   drawSign,
+  drawStoreBasket,
   drawTallGrass,
   drawTree,
   drawWater,
@@ -75,7 +79,11 @@ function paintStatic(world: World): HTMLCanvasElement {
           drawWell(ctx, px, py)
           break
         case "campfire":
+        case "store":
           drawPath(ctx, px, py, tx, ty)
+          break
+        case "site":
+          drawGrass(ctx, px, py, tx, ty)
           break
         case "water":
           break
@@ -99,8 +107,18 @@ function emoteFor(world: World, agent: Agent, t: number): EmoteKind | null {
       return "exclaim"
     case "chatting":
       return Math.floor(t / 600) % 2 ? "note" : "heart"
+    case "collapsed":
+      return "sad"
     case "acting":
       switch (s.intent.kind) {
+        case "work":
+          return agent.persona.craft === "stories" ? "note" : "hammer"
+        case "build":
+          return "hammer"
+        case "deposit":
+          return "gift"
+        case "meal":
+          return "berry"
         case "eat":
           return "berry"
         case "drink":
@@ -225,11 +243,15 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
         }
       }
       for (const bush of world.bushes) drawBush(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.berries)
+      const { project, store } = world
+      if (project.doneAt !== null) drawGranary(ctx, project.pos.x * TILE, project.pos.y * TILE)
+      else drawGranarySite(ctx, project.pos.x * TILE, project.pos.y * TILE, project.sessionsDone / project.sessionsNeeded)
+      drawStoreBasket(ctx, store.pos.x * TILE, store.pos.y * TILE, store.food)
 
       const night = darkness(world.tick)
       for (const house of world.houses) {
-        const owner = world.agents.find((a) => a.id === house.ownerId)
-        drawHouse(ctx, house.x * TILE, house.y * TILE, !!owner?.inside, night)
+        const lit = world.agents.some((a) => a.inside && house.residents.includes(a.id))
+        drawHouse(ctx, house.x * TILE, house.y * TILE, lit, night)
       }
 
       for (const { a, x, y, moving } of drawn) {
@@ -240,6 +262,7 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
         }
         const walkFrame = moving && alpha < 0.85 ? ((a.steps % 2) as 0 | 1) : null
         drawCharacter(ctx, a.persona, x, y, a.facing, walkFrame)
+        if (a.carry > 0 && a.status.kind !== "collapsed") drawCarry(ctx, x + 11, y + 9, a.carry)
       }
 
       // Night falls over the world but not over the UI marks.

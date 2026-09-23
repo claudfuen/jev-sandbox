@@ -1,5 +1,5 @@
-import type { JevAnswer, JevRequest, MoodReading, NeedKey, Perception, RawAnswer } from "@/lib/jev/schema"
-import { MOOD_LEVELS, NEED_KEYS } from "@/lib/jev/schema"
+import type { JevAnswer, JevRequest, MoodReading, MotiveKey, NeedKey, Perception, RawAnswer } from "@/lib/jev/schema"
+import { BODY_KEYS, MOOD_LEVELS, NEED_KEYS } from "@/lib/jev/schema"
 
 import { clockOf, formatClock, formatTime, isNight } from "./clock"
 import {
@@ -14,13 +14,18 @@ import {
   stepsTo,
 } from "./geometry"
 import { buildMap, idx, isWalkable, MAP_W, tileAt } from "./map"
-import { PERSONAS } from "./personas"
+import { FOUNDING_AFFINITY, PERSONAS } from "./personas"
+import { needRates, psycheLines } from "./psyche"
 import type {
   Agent,
   ChoiceMode,
+  CraftKind,
   DecisionRecord,
+  DriverKey,
+  House,
   Intent,
   Intervention,
+  LogEntry,
   OptionSpec,
   Status,
   Vec,
@@ -35,8 +40,11 @@ const BASE_DECAY: Record<NeedKey, number> = {
   hunger: 0.3,
   thirst: 0.38,
   energy: 0.2,
+  health: 0,
   social: 0.28,
   fun: 0.3,
+  purpose: 0.1,
+  respect: 0.05,
 }
 const NIGHT_ENERGY_DECAY = 0.15
 const SLEEP_ENERGY_GAIN = 0.85
@@ -45,20 +53,35 @@ const BERRY_REGROW_TICKS = 50
 const ERROR_BACKOFF_TICKS = 12
 const CHASE_GIVE_UP_TICKS = 50
 const BUSY_WAIT_TICKS = 10
-const MEMORY_KEEP = 12
-const MEMORY_IN_PROMPT = 6
-const DECISIONS_KEEP = 20
-const LOG_KEEP = 150
+const MEMORY_KEEP = 14
+const MEMORY_IN_PROMPT = 7
+const DECISIONS_KEEP = 24
+const LOG_KEEP = 200
+const TALK_OPTIONS = 3
+const CARRY_CAP = 4
+const WITNESS_RADIUS = 6
+const STORE_SPOIL_TICKS = 72
+const STORE_SAFE_WITHOUT_GRANARY = 6
+const MEAL_START = 18 * 60
+const MEAL_END = 19 * 60 + 30
 
-const ACT_TICKS: Record<Exclude<Intent["kind"], "sleep" | "talk">, number> = {
+const ACT_TICKS = {
   eat: 3,
   drink: 2,
   explore: 5,
   campfire: 8,
   wander: 2,
   rest: 6,
-}
+  work: 10,
+  build: 12,
+  gather: 2,
+  deposit: 1,
+  meal: 3,
+  take_store: 1,
+  eat_carry: 2,
+} satisfies Record<Exclude<Intent["kind"], "sleep" | "talk">, number>
 const CHAT_TICKS = 6
+const COLLAPSE_TICKS = 36
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -72,33 +95,39 @@ function nextRandom(world: World): number {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296
 }
 
-export const DEFAULT_CONFIG: WorldConfig = { seed: 7, scenario: "village" }
+export const DEFAULT_CONFIG: WorldConfig = { seed: 7, scenario: "founders" }
 
 export function createWorld(config: Partial<WorldConfig> = {}): World {
   const cfg: WorldConfig = { ...DEFAULT_CONFIG, ...config }
   const map = buildMap()
   const agents: Agent[] = PERSONAS.map((persona) => {
-    const house = map.houses.find((h) => h.ownerId === persona.id)
+    const house = map.houses.find((h) => h.residents.includes(persona.id))
     if (!house) throw new Error(`No house for ${persona.id}`)
-    const pos = { x: house.door.x, y: house.door.y + 1 }
+    const slot = house.residents.indexOf(persona.id)
+    const pos = { x: house.door.x + slot, y: house.door.y + 1 }
+    const affinity = Object.fromEntries(PERSONAS.filter((p) => p.id !== persona.id).map((p) => [p.id, 0.2]))
+    for (const [from, to, v] of FOUNDING_AFFINITY) if (from === persona.id) affinity[to] = v
     return {
       id: persona.id,
       persona,
+      psyche: structuredClone(persona.psyche),
       pos,
       prev: { ...pos },
       facing: "down",
       steps: 0,
       inside: false,
       needs: { ...persona.start },
+      needCause: {},
+      carry: 0,
       status: { kind: "idle", retryAt: 0 },
       memory: [{ tick: 0, text: "You woke up and stepped outside your house." }],
-      affinity: Object.fromEntries(
-        PERSONAS.filter((p) => p.id !== persona.id).map((p) => [p.id, 0.2]),
-      ),
+      affinity,
       visited: {},
       decisions: [],
+      drivers: {},
       mood: null,
       flash: null,
+      lastPurposeTick: -1,
     }
   })
   return {
@@ -132,7 +161,7 @@ function remember(world: World, agent: Agent, text: string) {
   if (agent.memory.length > MEMORY_KEEP) agent.memory.shift()
 }
 
-function log(world: World, text: string, agentIds: string[], tone: "info" | "social" | "error" = "info") {
+function log(world: World, text: string, agentIds: string[], tone: LogEntry["tone"] = "info") {
   world.log.push({ tick: world.tick, text, agentIds, tone })
   if (world.log.length > LOG_KEEP) world.log.shift()
 }
@@ -149,21 +178,166 @@ function nudgeAffinity(agent: Agent, otherId: string, delta: number) {
   agent.affinity[otherId] = Math.max(-1, Math.min(1, (agent.affinity[otherId] ?? 0) + delta))
 }
 
-function homeOf(world: World, agent: Agent) {
-  const house = world.houses.find((h) => h.ownerId === agent.id)
+function homeOf(world: World, agent: Agent): House {
+  const house = world.houses.find((h) => h.residents.includes(agent.id))
   if (!house) throw new Error(`No house for ${agent.id}`)
   return house
+}
+
+function names(world: World, ids: string[]): string {
+  const ns = ids.map((id) => nameOf(world, id))
+  return ns.length <= 1 ? ns.join("") : `${ns.slice(0, -1).join(", ")} and ${ns.at(-1)}`
 }
 
 const isWater = (world: World, p: Vec) => tileAt(world.tiles, p.x, p.y) === "water"
 const touchesWater = (world: World, p: Vec) => neighbors(p).some((n) => isWater(world, n))
 const nearCampfire = (world: World, p: Vec) =>
   Math.abs(p.x - world.campfire.x) <= 1 && Math.abs(p.y - world.campfire.y) <= 1 && !sameTile(p, world.campfire)
+const atStore = (world: World, p: Vec) => adjacent(p, world.store.pos)
+const atProject = (world: World, p: Vec) => {
+  const { pos, size } = world.project
+  const dx = Math.max(pos.x - p.x, 0, p.x - (pos.x + size.x - 1))
+  const dy = Math.max(pos.y - p.y, 0, p.y - (pos.y + size.y - 1))
+  return dx + dy === 1
+}
 
-/** Where an intent walks to. Talk targets move, so they are re-planned every tick. */
+const GARDEN: Vec = { x: 9, y: 13 }
+const FORAGE: Vec = { x: 11, y: 17 }
+const SHRINE: Vec = { x: 15, y: 16 }
+
+function isMealTime(world: World): boolean {
+  const { minuteOfDay } = clockOf(world.tick)
+  return minuteOfDay >= MEAL_START - 30 && minuteOfDay < MEAL_END
+}
+
+const projectDone = (world: World) => world.project.doneAt !== null
+const pctBuilt = (world: World) => Math.round((world.project.sessionsDone / world.project.sessionsNeeded) * 100)
+
+// ---------------------------------------------------------------------------
+// Crafts: each vocation's day job, what it does, and where
+
+type Craft = {
+  label: string
+  detail: (world: World, agent: Agent) => string
+  status: string
+  goal: (world: World) => (p: Vec) => boolean
+  available: (world: World, agent: Agent) => boolean
+  drivers: DriverKey[]
+  finish: (world: World, agent: Agent) => string
+}
+
+const addCarry = (agent: Agent, n: number) => {
+  const got = Math.min(n, CARRY_CAP - agent.carry)
+  agent.carry += got
+  return got
+}
+
+const CRAFTS: Record<CraftKind, Craft> = {
+  build: {
+    label: "Do repairs and upkeep around the village",
+    detail: () => "Your trade. Fix fences, doors and roofs so the village stays in good shape. About an hour of honest work.",
+    status: "doing repairs around the village",
+    goal: (world) => (p) => manhattan(p, world.campfire) === 3,
+    available: (world) => projectDone(world),
+    drivers: ["purpose", "mastery"],
+    finish: () => "You spent an hour on repairs around the village.",
+  },
+  cook: {
+    label: "Cook a hot meal from the store's food",
+    detail: (world) =>
+      `Your trade. A hot meal stretches the food: 2 portions from the store become 3. The store holds ${world.store.food} food. About an hour at the campfire.`,
+    status: "cooking at the campfire",
+    goal: (world) => (p) => nearCampfire(world, p),
+    available: (world) => world.store.food >= 2,
+    drivers: ["purpose", "providing", "mastery"],
+    finish: (world) => {
+      world.store.food += 1
+      count(world, "food_cooked", 3)
+      return "You cooked a hot meal and put 3 portions in the store."
+    },
+  },
+  farm: {
+    label: "Tend the garden patch",
+    detail: () => "Your trade. Weeding and harvesting the garden west of the plaza brings in about 2 food to carry. About an hour.",
+    status: "tending the garden",
+    goal: () => (p) => sameTile(p, GARDEN),
+    available: (_, agent) => agent.carry < CARRY_CAP,
+    drivers: ["purpose", "providing", "mastery"],
+    finish: (world, agent) => {
+      const got = addCarry(agent, 2)
+      count(world, "food_produced", got)
+      return `You tended the garden and brought in ${got} food.`
+    },
+  },
+  forage: {
+    label: "Forage in the tall grass",
+    detail: () => "Your trade. Searching the tall grass for roots and berries brings in about 2 food to carry, and you never know what you will find. About an hour.",
+    status: "foraging in the tall grass",
+    goal: () => (p) => sameTile(p, FORAGE),
+    available: (_, agent) => agent.carry < CARRY_CAP,
+    drivers: ["purpose", "providing", "curiosity"],
+    finish: (world, agent) => {
+      const got = addCarry(agent, 2)
+      agent.needs.fun = clamp(agent.needs.fun + 10)
+      count(world, "food_produced", got)
+      return `You foraged in the tall grass and found ${got} food.`
+    },
+  },
+  fish: {
+    label: "Fish at the pond",
+    detail: () => "Your trade. An hour with a line at the pond brings in about 2 fish to carry.",
+    status: "fishing at the pond",
+    goal: (world) => (p) => touchesWater(world, p),
+    available: (_, agent) => agent.carry < CARRY_CAP,
+    drivers: ["purpose", "providing", "mastery"],
+    finish: (world, agent) => {
+      const got = addCarry(agent, 2)
+      count(world, "food_produced", got)
+      return `You caught ${got} fish at the pond.`
+    },
+  },
+  keep_store: {
+    label: "Tend the village store and keep its tally",
+    detail: (world) => `Your duty. Count what goes in and out of the store and keep it tidy. The store holds ${world.store.food} food.`,
+    status: "tending the village store",
+    goal: (world) => (p) => atStore(world, p),
+    available: () => true,
+    drivers: ["purpose"],
+    finish: (world, agent) => {
+      agent.needs.respect = clamp(agent.needs.respect + 3)
+      return `You tended the store and counted ${world.store.food} food.`
+    },
+  },
+  shrine: {
+    label: "Tend the shrine at the old well",
+    detail: () => "Your duty. Sweep the well shrine, refresh the offerings and keep the old customs alive. About an hour.",
+    status: "tending the shrine at the old well",
+    goal: () => (p) => sameTile(p, SHRINE),
+    available: () => true,
+    drivers: ["purpose"],
+    finish: (_, agent) => {
+      agent.needs.respect = clamp(agent.needs.respect + 3)
+      return "You tended the shrine at the old well."
+    },
+  },
+  stories: {
+    label: "Play music and tell stories by the campfire",
+    detail: () => "Your calling. Anyone nearby gets a lift from the music and stories. About an hour at the campfire.",
+    status: "playing music and telling stories",
+    goal: (world) => (p) => nearCampfire(world, p),
+    available: () => true,
+    drivers: ["purpose", "pleasure", "belonging"],
+    finish: () => "You played music and told stories by the campfire.",
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Movement goals
+
 function goalFor(world: World, agent: Agent, intent: Intent): (p: Vec) => boolean {
   switch (intent.kind) {
-    case "eat": {
+    case "eat":
+    case "gather": {
       const bush = world.bushes.find((b) => b.id === intent.bushId)
       return (p) => !!bush && adjacent(p, bush.pos)
     }
@@ -182,11 +356,20 @@ function goalFor(world: World, agent: Agent, intent: Intent): (p: Vec) => boolea
     case "wander":
       return (p) => sameTile(p, intent.target)
     case "rest":
+    case "eat_carry":
       return () => true
     case "talk": {
       const target = agentById(world, intent.targetId)
       return (p) => !!target && manhattan(p, target.pos) <= 1
     }
+    case "work":
+      return CRAFTS[agent.persona.craft].goal(world)
+    case "build":
+      return (p) => atProject(world, p)
+    case "deposit":
+    case "meal":
+    case "take_store":
+      return (p) => atStore(world, p)
   }
 }
 
@@ -196,6 +379,7 @@ function goalFor(world: World, agent: Agent, intent: Intent): (p: Vec) => boolea
 function intentPhrase(world: World, intent: Intent, viewer?: Agent): string {
   switch (intent.kind) {
     case "eat":
+    case "gather":
       return "the berry bushes"
     case "drink":
       return "the pond"
@@ -208,9 +392,18 @@ function intentPhrase(world: World, intent: Intent, viewer?: Agent): string {
     case "wander":
       return "nowhere in particular"
     case "rest":
+    case "eat_carry":
       return "a spot to rest"
     case "talk":
       return viewer && intent.targetId === viewer.id ? "you" : nameOf(world, intent.targetId)
+    case "work":
+      return "work"
+    case "build":
+      return "the granary build site"
+    case "deposit":
+    case "meal":
+    case "take_store":
+      return "the village store"
   }
 }
 
@@ -224,10 +417,24 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
     case "deciding":
       return "standing still, thinking"
     case "moving":
-      if (s.intent.kind === "talk") return `walking over to ${who(s.intent.targetId)}`
-      if (s.intent.kind === "wander") return "wandering around"
-      if (s.intent.kind === "sleep") return "heading home"
-      return `heading to ${intentPhrase(world, s.intent, viewer)}`
+      switch (s.intent.kind) {
+        case "talk":
+          return `walking over to ${who(s.intent.targetId)}`
+        case "wander":
+          return "wandering around"
+        case "sleep":
+          return "heading home"
+        case "work":
+          return `heading off to work (${CRAFTS[agent.persona.craft].status})`
+        case "gather":
+          return "going to gather berries"
+        case "deposit":
+          return "bringing food to the village store"
+        case "meal":
+          return "heading to the evening meal"
+        default:
+          return `heading to ${intentPhrase(world, s.intent, viewer)}`
+      }
     case "acting":
       switch (s.intent.kind) {
         case "eat":
@@ -242,6 +449,20 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
           return "strolling around"
         case "rest":
           return "sitting and resting"
+        case "work":
+          return CRAFTS[agent.persona.craft].status
+        case "build":
+          return "working on the granary"
+        case "gather":
+          return "gathering berries"
+        case "deposit":
+          return "putting food in the village store"
+        case "meal":
+          return "eating at the evening meal"
+        case "take_store":
+          return "taking food from the village store"
+        case "eat_carry":
+          return "eating the food they carry"
         default:
           return "busy"
       }
@@ -253,6 +474,8 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
       return `chatting with ${who(s.partnerId)}`
     case "sleeping":
       return "asleep inside their house"
+    case "collapsed":
+      return "collapsed on the ground, too weak to move"
   }
 }
 
@@ -262,11 +485,15 @@ export function describeLocation(world: World, agent: Agent, viewer: Agent = age
   for (const lm of world.landmarks) {
     const d = manhattan(agent.pos, lm.center)
     if (d > lm.radius || (best && d >= best.d)) continue
-    const name = lm.ownerId
-      ? lm.ownerId === viewer.id
+    let name = `near ${lm.name}`
+    if (lm.houseId) {
+      const house = world.houses.find((h) => h.id === lm.houseId)!
+      name = house.residents.includes(viewer.id)
         ? "right outside your house"
-        : `outside ${nameOf(world, lm.ownerId)}'s house`
-      : `near ${lm.name}`
+        : house.residents.length
+          ? `outside ${names(world, house.residents)}'s house`
+          : "outside the empty house"
+    }
     best = { name, d }
   }
   return best?.name ?? "out in the open fields"
@@ -285,6 +512,19 @@ function stepsPhrase(n: number | null): string {
   if (n === null) return "unreachable from here"
   if (n === 0) return "right here"
   return `${n} step${n === 1 ? "" : "s"} away`
+}
+
+function contributorsPhrase(world: World): string {
+  const entries = Object.entries(world.project.contributors).sort((a, b) => b[1] - a[1])
+  if (!entries.length) return "nobody has worked on it yet"
+  return `worked on by ${entries.map(([id, n]) => `${nameOf(world, id)} (${n} session${n === 1 ? "" : "s"})`).join(", ")}`
+}
+
+function purposeCause(world: World, agent: Agent): string {
+  if (agent.lastPurposeTick < 0) return "you have not done any meaningful work yet"
+  const since = world.tick - agent.lastPurposeTick
+  if (since > 144) return "you have not done meaningful work for a long while"
+  return `your last meaningful work was at ${formatTime(agent.lastPurposeTick)}`
 }
 
 // ---------------------------------------------------------------------------
@@ -306,9 +546,22 @@ export function perceive(world: World, agent: Agent, askedBy?: Agent): Perceptio
     }
     const steps = manhattan(agent.pos, other.pos)
     noticing.push(
-      `${other.persona.name} is ${steps <= 1 ? "right next to you" : `${steps} steps ${compass(agent.pos, other.pos)}`}, ${describeStatus(world, other, agent)}.`,
+      `${other.persona.name} (${other.persona.vocation}) is ${steps <= 1 ? "right next to you" : `${steps} steps ${compass(agent.pos, other.pos)}`}, ${describeStatus(world, other, agent)}.`,
     )
   }
+
+  const { store } = world
+  noticing.push(
+    `The village store holds ${store.food} food. By agreement it is shared at the evening meal at 6 pm${isMealTime(world) ? ", and the meal is on now" : ""}.`,
+  )
+  if (projectDone(world)) {
+    noticing.push(`The granary is finished (${contributorsPhrase(world)}), so the store's food no longer spoils.`)
+  } else {
+    noticing.push(
+      `The granary is ${pctBuilt(world)}% built (${contributorsPhrase(world)}). Until it is finished, the store loses food to spoilage whenever it holds more than ${STORE_SAFE_WITHOUT_GRANARY}.`,
+    )
+  }
+  if (agent.carry > 0) noticing.push(`You are carrying ${agent.carry} food.`)
 
   const stocked = world.bushes.filter((b) => b.berries > 0)
   const berriesLeft = stocked.reduce((n, b) => n + b.berries, 0)
@@ -316,33 +569,26 @@ export function perceive(world: World, agent: Agent, askedBy?: Agent): Perceptio
     noticing.push("Every berry bush in the grove has been picked clean for now.")
   } else {
     const d = stepsTo(field, (p) => stocked.some((b) => adjacent(p, b.pos)))
-    noticing.push(
-      `The berry grove has ${berriesLeft} berr${berriesLeft === 1 ? "y" : "ies"} left across ${stocked.length} bush${stocked.length === 1 ? "" : "es"}; the nearest is ${stepsPhrase(d)}.`,
-    )
+    noticing.push(`The berry grove has ${berriesLeft} berr${berriesLeft === 1 ? "y" : "ies"} left; the nearest bush is ${stepsPhrase(d)}.`)
   }
   noticing.push(`The pond is ${stepsPhrase(stepsTo(field, (p) => touchesWater(world, p)))}.`)
-  const home = homeOf(world, agent)
-  noticing.push(`Your house is ${stepsPhrase(stepsTo(field, (p) => sameTile(p, home.door)))}.`)
-  const atFire = world.agents.filter(
-    (a) => a.id !== agent.id && a.status.kind === "acting" && a.status.intent.kind === "campfire",
-  )
-  noticing.push(
-    `The campfire is ${stepsPhrase(stepsTo(field, (p) => nearCampfire(world, p)))}${atFire.length ? `; ${atFire.map((a) => a.persona.name).join(" and ")} ${atFire.length === 1 ? "is" : "are"} hanging out there` : ""}.`,
-  )
   if (askedBy) noticing.push(`${askedBy.persona.name} just walked up to you and wants to chat.`)
 
   return {
     name: agent.persona.name,
+    role: `the village ${agent.persona.vocation}`,
     blurb: agent.persona.blurb,
-    traits: agent.persona.traits,
+    psyche: psycheLines(agent.psyche),
     clock: formatClock(world.tick),
     location: describeLocation(world, agent),
     needs: Object.fromEntries(NEED_KEYS.map((k) => [k, Math.round(agent.needs[k])])) as Perception["needs"],
-    noticing,
+    needCauses: { ...agent.needCause, purpose: agent.needCause.purpose ?? purposeCause(world, agent) },
+    noticing: noticing.slice(0, 32),
     memories: agent.memory.slice(-MEMORY_IN_PROMPT).map((m) => `${formatTime(m.tick)}: ${m.text}`),
     feelings: world.agents
       .filter((a) => a.id !== agent.id)
-      .map((a) => `${a.persona.name}: ${affinityWords(agent.affinity[a.id] ?? 0)}.`),
+      .map((a) => `${a.persona.name}: ${affinityWords(agent.affinity[a.id] ?? 0)}.`)
+      .slice(0, 8),
   }
 }
 
@@ -350,14 +596,13 @@ function lastVisitPhrase(world: World, agent: Agent, poiId: string): string {
   const at = agent.visited[poiId]
   if (at === undefined) return "you have not been there yet"
   const { day } = clockOf(at)
-  return day === clockOf(world.tick).day
-    ? `you were last there at ${formatTime(at)}`
-    : "you have not been there today"
+  return day === clockOf(world.tick).day ? `you were last there at ${formatTime(at)}` : "you have not been there today"
 }
 
 export function buildOptions(world: World, agent: Agent): OptionSpec[] {
   const field = distanceField(world.tiles, agent.pos)
   const options: OptionSpec[] = []
+  const add = (o: OptionSpec) => options.push(o)
 
   let nearestBush: { id: string; d: number; berries: number } | null = null
   for (const bush of world.bushes) {
@@ -366,54 +611,124 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
     if (d !== null && (!nearestBush || d < nearestBush.d)) nearestBush = { id: bush.id, d, berries: bush.berries }
   }
   if (nearestBush) {
-    options.push({
+    add({
       id: "eat",
       label: "Go eat berries",
       detail: `Eating fills your hunger. The nearest bush with berries is ${stepsPhrase(nearestBush.d)} and has ${nearestBush.berries} left.`,
       intent: { kind: "eat", bushId: nearestBush.id },
+      drivers: ["body"],
+    })
+    if (agent.carry < CARRY_CAP) {
+      add({
+        id: "gather",
+        label: "Gather berries to carry",
+        detail: `Pick berries to take with you (you can carry up to ${CARRY_CAP}; you carry ${agent.carry}). You could keep them, eat them later or put them in the store.`,
+        intent: { kind: "gather", bushId: nearestBush.id },
+        drivers: ["security"],
+      })
+    }
+  }
+  if (agent.carry > 0) {
+    add({
+      id: "eat_carry",
+      label: "Eat the food you are carrying",
+      detail: `Eat some of your ${agent.carry} food right where you are.`,
+      intent: { kind: "eat_carry" },
+      drivers: ["body"],
+    })
+    add({
+      id: "deposit",
+      label: "Put the food you carry into the village store",
+      detail: `Give your ${agent.carry} food to the store so everyone can eat it at the evening meal.`,
+      intent: { kind: "deposit" },
+      drivers: ["generosity", "providing"],
     })
   }
 
-  options.push({
+  add({
     id: "drink",
     label: "Drink at the pond",
     detail: `Drinking quenches your thirst. The pond is ${stepsPhrase(stepsTo(field, (p) => touchesWater(world, p)))}.`,
     intent: { kind: "drink" },
+    drivers: ["body"],
   })
 
   const home = homeOf(world, agent)
-  options.push({
+  add({
     id: "sleep",
     label: "Go home and sleep",
     detail: `Sleeping restores your energy; you stay inside until you feel rested. Your house is ${stepsPhrase(stepsTo(field, (p) => sameTile(p, home.door)))}.`,
     intent: { kind: "sleep" },
+    drivers: ["body"],
   })
 
-  for (const other of world.agents) {
-    if (other.id === agent.id || !canApproach(other)) continue
-    options.push({
+  if (world.store.food > 0) {
+    if (isMealTime(world)) {
+      add({
+        id: "meal",
+        label: "Join the evening meal at the village store",
+        detail: `The village shares the store's food now. It holds ${world.store.food} food; you would eat up to 2 portions with whoever else comes.`,
+        intent: { kind: "meal" },
+        drivers: ["belonging", "body"],
+      })
+    } else {
+      add({
+        id: "take_store",
+        label: "Take food from the village store for yourself",
+        detail: `The village agreed the store is shared at the evening meal; taking food at other times breaks that agreement. You would carry up to 2 of its ${world.store.food} food. Anyone who sees you will think less of you.`,
+        intent: { kind: "take_store" },
+        drivers: ["greed"],
+      })
+    }
+  }
+
+  if (!projectDone(world)) {
+    const isBuilder = agent.persona.craft === "build"
+    add({
+      id: "build",
+      label: isBuilder ? "Work on the granary (your trade)" : "Help build the granary",
+      detail: `A session of about an hour on the village granary, which will stop the store's food from spoiling. It is ${pctBuilt(world)}% built; ${contributorsPhrase(world)}. Everyone can see who worked on it.`,
+      intent: { kind: "build", projectId: world.project.id },
+      drivers: ["building", "purpose", "belonging"],
+    })
+  }
+
+  const craft = CRAFTS[agent.persona.craft]
+  if (craft.available(world, agent)) {
+    add({ id: "work", label: craft.label, detail: craft.detail(world, agent), intent: { kind: "work" }, drivers: craft.drivers })
+  }
+
+  const approachable = world.agents
+    .filter((o) => o.id !== agent.id && canApproach(o))
+    .sort((a, b) => manhattan(agent.pos, a.pos) - manhattan(agent.pos, b.pos))
+    .slice(0, TALK_OPTIONS)
+  for (const other of approachable) {
+    add({
       id: `talk_${other.id}`,
       label: `Go chat with ${other.persona.name}`,
       detail: `Chatting eases loneliness and is a little fun, but they may say no. ${other.persona.name} is ${manhattan(agent.pos, other.pos)} steps away, ${describeStatus(world, other, agent)}.`,
       intent: { kind: "talk", targetId: other.id },
+      drivers: ["belonging"],
     })
   }
 
-  options.push({
+  add({
     id: "campfire",
     label: "Hang out by the campfire",
     detail: `A cozy, relaxing spot that is a little fun and where villagers bump into each other. The campfire is ${stepsPhrase(stepsTo(field, (p) => nearCampfire(world, p)))}.`,
     intent: { kind: "campfire" },
+    drivers: ["belonging", "pleasure"],
   })
 
   for (const poi of world.pois) {
     const d = field[idx(poi.stand.x, poi.stand.y)]
     if (d < 0) continue
-    options.push({
+    add({
       id: `explore_${poi.id}`,
       label: `Explore ${poi.name}`,
       detail: `Exploring is fun and cures boredom, especially somewhere you have not been lately. It is ${stepsPhrase(d)}; ${lastVisitPhrase(world, agent, poi.id)}.`,
       intent: { kind: "explore", poiId: poi.id },
+      drivers: ["curiosity"],
     })
   }
 
@@ -423,19 +738,21 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
   }
   if (nearby.length) {
     const target = nearby[Math.floor(nextRandom(world) * nearby.length)]
-    options.push({
+    add({
       id: "wander",
       label: "Wander around nearby",
       detail: "An aimless little stroll close by. Mildly fun and low effort.",
       intent: { kind: "wander", target },
+      drivers: ["pleasure"],
     })
   }
 
-  options.push({
+  add({
     id: "rest",
     label: "Sit down and rest right here",
-    detail: "Take it easy without going anywhere. Restores a little energy but does nothing for hunger, thirst, loneliness or boredom.",
+    detail: "Take it easy without going anywhere. Restores a little energy but does nothing for hunger, thirst, loneliness, boredom or purpose.",
     intent: { kind: "rest" },
+    drivers: ["rest"],
   })
 
   return options
@@ -449,8 +766,8 @@ function becomeIdle(world: World, agent: Agent, delay = 0) {
 }
 
 function startIntent(world: World, agent: Agent, intent: Intent) {
-  if (intent.kind === "rest") {
-    agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.rest }
+  if (intent.kind === "rest" || intent.kind === "eat_carry") {
+    agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS[intent.kind] }
     return
   }
   const path = findPath(world.tiles, agent.pos, goalFor(world, agent, intent))
@@ -463,20 +780,46 @@ function startIntent(world: World, agent: Agent, intent: Intent) {
   if (path.length === 0) arrive(world, agent, intent)
 }
 
+/** Who can see `agent` right now: awake, outside, within the witness radius. */
+function witnessesOf(world: World, agent: Agent): Agent[] {
+  return world.agents.filter(
+    (o) =>
+      o.id !== agent.id &&
+      !o.inside &&
+      o.status.kind !== "sleeping" &&
+      o.status.kind !== "collapsed" &&
+      manhattan(o.pos, agent.pos) <= WITNESS_RADIUS,
+  )
+}
+
+function markPurpose(world: World, agent: Agent, what: string) {
+  agent.lastPurposeTick = world.tick
+  agent.needCause.purpose = `you ${what} at ${formatTime(world.tick)}`
+}
+
 function arrive(world: World, agent: Agent, intent: Intent) {
   switch (intent.kind) {
-    case "eat": {
+    case "eat":
+    case "gather": {
       const bush = world.bushes.find((b) => b.id === intent.bushId)
       if (!bush || bush.berries <= 0) {
         remember(world, agent, "You reached the berry bush but it had been picked clean.")
         flash(world, agent, "sweat")
-        log(world, `${agent.persona.name} found an empty berry bush.`, [agent.id])
         becomeIdle(world, agent)
+        return
+      }
+      agent.facing = facingToward(agent.pos, bush.pos)
+      if (intent.kind === "gather") {
+        const n = Math.min(bush.berries, 2, CARRY_CAP - agent.carry)
+        bush.berries -= n
+        agent.carry += n
+        if (bush.nextRegrow <= world.tick) bush.nextRegrow = world.tick + BERRY_REGROW_TICKS
+        count(world, "berries_gathered", n)
+        agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.gather }
         return
       }
       bush.berries -= 1
       if (bush.nextRegrow <= world.tick) bush.nextRegrow = world.tick + BERRY_REGROW_TICKS
-      agent.facing = facingToward(agent.pos, bush.pos)
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.eat }
       return
     }
@@ -500,8 +843,84 @@ function arrive(world: World, agent: Agent, intent: Intent) {
       agent.facing = facingToward(agent.pos, world.campfire)
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.campfire }
       return
+    case "work":
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.work }
+      return
+    case "build":
+      agent.facing = facingToward(agent.pos, { x: world.project.pos.x + 1, y: world.project.pos.y })
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.build }
+      return
+    case "deposit": {
+      agent.facing = facingToward(agent.pos, world.store.pos)
+      const n = agent.carry
+      if (n > 0) {
+        world.store.food += n
+        agent.carry = 0
+        agent.needs.purpose = clamp(agent.needs.purpose + 6)
+        agent.needs.respect = clamp(agent.needs.respect + 3)
+        markPurpose(world, agent, "gave food to the village store")
+        count(world, "deposits")
+        count(world, "food_deposited", n)
+        remember(world, agent, `You put ${n} food into the village store.`)
+        log(world, `${agent.persona.name} put ${n} food into the village store.`, [agent.id], "good")
+        flash(world, agent, "thanks", 4)
+      }
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.deposit }
+      return
+    }
+    case "meal": {
+      agent.facing = facingToward(agent.pos, world.store.pos)
+      const n = Math.min(2, world.store.food)
+      if (n === 0) {
+        remember(world, agent, "You came to the evening meal but the store was empty.")
+        count(world, "empty_meals")
+        flash(world, agent, "sweat")
+        becomeIdle(world, agent)
+        return
+      }
+      world.store.food -= n
+      agent.needs.hunger = clamp(agent.needs.hunger + 12 * n)
+      count(world, "meals_shared")
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.meal }
+      return
+    }
+    case "take_store": {
+      agent.facing = facingToward(agent.pos, world.store.pos)
+      const n = Math.min(2, world.store.food, CARRY_CAP - agent.carry)
+      if (n <= 0) {
+        becomeIdle(world, agent)
+        return
+      }
+      world.store.food -= n
+      agent.carry += n
+      const seenBy = witnessesOf(world, agent)
+      if (seenBy.length) {
+        count(world, "thefts_seen")
+        agent.needs.respect = clamp(agent.needs.respect - 12)
+        agent.needCause.respect = `${names(world, seenBy.map((w) => w.id))} saw you take food from the store outside mealtime`
+        remember(world, agent, `You took ${n} food from the store, and ${names(world, seenBy.map((w) => w.id))} saw you.`)
+        for (const w of seenBy) {
+          remember(world, w, `You saw ${agent.persona.name} take food from the village store outside mealtime.`)
+          nudgeAffinity(w, agent.id, -0.2)
+          flash(world, w, "eye", 6)
+        }
+        log(
+          world,
+          `${names(world, seenBy.map((w) => w.id))} saw ${agent.persona.name} take ${n} food from the store outside mealtime.`,
+          [agent.id, ...seenBy.map((w) => w.id)],
+          "conflict",
+        )
+      } else {
+        count(world, "thefts_unseen")
+        remember(world, agent, `You took ${n} food from the village store and nobody saw.`)
+        log(world, `Unseen: ${agent.persona.name} quietly took ${n} food from the village store.`, [agent.id], "conflict")
+      }
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.take_store }
+      return
+    }
     case "wander":
     case "rest":
+    case "eat_carry":
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS[intent.kind] }
       return
     case "talk":
@@ -510,12 +929,32 @@ function arrive(world: World, agent: Agent, intent: Intent) {
   }
 }
 
+function completeProject(world: World) {
+  const { project } = world
+  project.doneAt = world.tick
+  count(world, "projects_completed")
+  const credited = Object.keys(project.contributors)
+  for (const a of world.agents) {
+    if (credited.includes(a.id)) {
+      a.needs.purpose = clamp(a.needs.purpose + 15)
+      a.needs.respect = clamp(a.needs.respect + 15)
+      a.needCause.respect = "the village credits you with building the granary"
+      remember(world, a, `The granary is finished, and you helped build it (${project.contributors[a.id]} sessions).`)
+    } else {
+      remember(world, a, `The granary was finished by ${contributorsPhrase(world).replace("worked on by ", "")}.`)
+    }
+  }
+  log(world, `The granary is finished! ${contributorsPhrase(world).replace("worked on by", "Built by")}.`, credited, "good")
+}
+
 function finishActing(world: World, agent: Agent, intent: Intent) {
   switch (intent.kind) {
     case "eat":
       count(world, "meals")
       remember(world, agent, "You ate berries in the grove.")
-      log(world, `${agent.persona.name} ate some berries.`, [agent.id])
+      break
+    case "gather":
+      remember(world, agent, `You gathered berries and now carry ${agent.carry}.`)
       break
     case "drink":
       remember(world, agent, "You drank at the pond.")
@@ -524,7 +963,6 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
       const name = world.pois.find((p) => p.id === intent.poiId)?.name ?? "somewhere"
       count(world, "explorations")
       remember(world, agent, `You explored ${name}.`)
-      log(world, `${agent.persona.name} explored ${name}.`, [agent.id])
       break
     }
     case "campfire": {
@@ -534,9 +972,7 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
       remember(
         world,
         agent,
-        others.length
-          ? `You hung out by the campfire with ${others.map((a) => a.persona.name).join(" and ")}.`
-          : "You hung out by the campfire alone.",
+        others.length ? `You hung out by the campfire with ${names(world, others.map((o) => o.id))}.` : "You hung out by the campfire alone.",
       )
       break
     }
@@ -545,6 +981,39 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
       break
     case "rest":
       remember(world, agent, "You sat and rested for a while.")
+      break
+    case "work": {
+      const text = CRAFTS[agent.persona.craft].finish(world, agent)
+      count(world, "work_sessions")
+      count(world, `work_${agent.persona.craft}`)
+      markPurpose(world, agent, "worked at your trade")
+      remember(world, agent, text)
+      log(world, `${agent.persona.name}: ${text.replace(/^You /, "").replace(/\.$/, "")}.`, [agent.id], "good")
+      break
+    }
+    case "build": {
+      const { project } = world
+      if (projectDone(world)) break
+      project.sessionsDone += 1
+      project.contributors[agent.id] = (project.contributors[agent.id] ?? 0) + 1
+      count(world, "build_sessions")
+      markPurpose(world, agent, "worked on the granary")
+      agent.needCause.respect = "everyone can see you are helping build the granary"
+      remember(world, agent, `You put in a session on the granary (${project.sessionsDone} of ${project.sessionsNeeded}).`)
+      log(world, `${agent.persona.name} worked on the granary (${pctBuilt(world)}% built).`, [agent.id], "good")
+      if (project.sessionsDone >= project.sessionsNeeded) completeProject(world)
+      break
+    }
+    case "meal": {
+      const company = world.agents.filter((a) => a.id !== agent.id && a.status.kind === "acting" && a.status.intent.kind === "meal")
+      remember(world, agent, company.length ? `You ate the evening meal with ${names(world, company.map((c) => c.id))}.` : "You ate the evening meal alone.")
+      break
+    }
+    case "eat_carry":
+      remember(world, agent, "You ate some of the food you were carrying.")
+      break
+    case "deposit":
+    case "take_store":
       break
   }
   becomeIdle(world, agent)
@@ -625,13 +1094,23 @@ function issue(world: World, init: RequestInit): SimRequest {
 function decayNeeds(world: World, agent: Agent) {
   const night = isNight(world.tick)
   const s = agent.status.kind
+  const asleep = s === "sleeping" || s === "collapsed"
+  const rates = needRates(agent.psyche)
   for (const key of NEED_KEYS) {
+    if (key === "health") continue
     let rate = BASE_DECAY[key] * (agent.persona.decay[key] ?? 1)
+    if (key === "social" || key === "fun" || key === "purpose" || key === "respect") rate *= rates[key]
     if (key === "energy" && night) rate += NIGHT_ENERGY_DECAY
-    if (s === "sleeping") rate *= key === "hunger" || key === "thirst" ? 0.35 : 0.15
+    if (asleep) rate *= key === "hunger" || key === "thirst" ? 0.35 : key === "energy" ? 1 : 0.15
     agent.needs[key] = clamp(agent.needs[key] - rate)
   }
-  if (s === "sleeping") agent.needs.energy = clamp(agent.needs.energy + SLEEP_ENERGY_GAIN)
+  if (asleep) agent.needs.energy = clamp(agent.needs.energy + SLEEP_ENERGY_GAIN + 0.2)
+
+  // Health: falls while starving or parched, recovers slowly otherwise.
+  const deprived = agent.needs.hunger < 10 || agent.needs.thirst < 10
+  agent.needs.health = clamp(agent.needs.health + (deprived ? -0.35 : asleep ? 0.25 : 0.05))
+  if (deprived) agent.needCause.health = "you are going without food or water"
+  else if (agent.needs.health >= 95) delete agent.needCause.health
 }
 
 function applyActing(world: World, agent: Agent, intent: Intent) {
@@ -661,6 +1140,38 @@ function applyActing(world: World, agent: Agent, intent: Intent) {
     case "rest":
       n.energy = clamp(n.energy + 0.8)
       break
+    case "work": {
+      n.purpose = clamp(n.purpose + 3)
+      n.energy = clamp(n.energy - 0.1)
+      if (agent.persona.craft === "stories") {
+        n.fun = clamp(n.fun + 2)
+        for (const o of world.agents) {
+          if (o.id === agent.id || o.inside || manhattan(o.pos, agent.pos) > 3) continue
+          o.needs.fun = clamp(o.needs.fun + 1.5)
+          o.needs.social = clamp(o.needs.social + 0.5)
+        }
+      }
+      break
+    }
+    case "build": {
+      const crew = world.agents.some((a) => a.id !== agent.id && a.status.kind === "acting" && a.status.intent.kind === "build")
+      n.purpose = clamp(n.purpose + 2.5)
+      n.respect = clamp(n.respect + 0.5)
+      n.energy = clamp(n.energy - 0.15)
+      if (crew) n.social = clamp(n.social + 1)
+      break
+    }
+    case "meal":
+      n.social = clamp(n.social + 2)
+      break
+    case "eat_carry":
+      if (agent.carry > 0) {
+        agent.carry -= 1
+        n.hunger = clamp(n.hunger + 12)
+      }
+      break
+    default:
+      break
   }
 }
 
@@ -672,10 +1183,32 @@ function regrowBerries(world: World) {
   }
 }
 
+/** Without a granary, a well stocked store loses food. Deterministic physics. */
+function spoilStore(world: World) {
+  const { store } = world
+  if (projectDone(world) || store.food <= STORE_SAFE_WITHOUT_GRANARY) {
+    store.nextSpoil = world.tick + STORE_SPOIL_TICKS
+    return
+  }
+  if (world.tick < store.nextSpoil) return
+  store.food -= 1
+  store.nextSpoil = world.tick + STORE_SPOIL_TICKS
+  count(world, "food_spoiled")
+}
+
+function collapse(world: World, agent: Agent) {
+  agent.status = { kind: "collapsed", ticksLeft: COLLAPSE_TICKS }
+  agent.needs.health = 5
+  count(world, "collapses")
+  remember(world, agent, "You collapsed from hunger and thirst.")
+  log(world, `${agent.persona.name} collapsed from hunger and thirst.`, [agent.id], "conflict")
+}
+
 export function step(world: World): SimRequest[] {
   world.tick += 1
   const requests: SimRequest[] = []
   regrowBerries(world)
+  spoilStore(world)
 
   for (const agent of world.agents) {
     agent.prev = { ...agent.pos }
@@ -684,6 +1217,7 @@ export function step(world: World): SimRequest[] {
 
   for (const agent of world.agents) {
     decayNeeds(world, agent)
+    if (agent.needs.health <= 0 && agent.status.kind !== "collapsed" && !agent.inside) collapse(world, agent)
     const s = agent.status
     switch (s.kind) {
       case "idle":
@@ -744,6 +1278,15 @@ export function step(world: World): SimRequest[] {
         }
         break
       }
+      case "collapsed":
+        agent.needs.energy = clamp(agent.needs.energy + 0.5)
+        s.ticksLeft -= 1
+        if (s.ticksLeft <= 0) {
+          agent.needs.health = Math.max(agent.needs.health, 25)
+          remember(world, agent, "You came to, weak and shaken.")
+          becomeIdle(world, agent)
+        }
+        break
     }
   }
   return requests
@@ -776,6 +1319,13 @@ export function readMood(answer: RawAnswer | undefined): MoodReading | null {
   return { level, label: MOOD_LEVELS[level], probabilities }
 }
 
+function readMotive(answer: RawAnswer | undefined): DecisionRecord["motive"] {
+  if (!answer || answer.type !== "choice") return null
+  return Object.entries(answer.probabilities)
+    .map(([id, p]) => ({ id: id as MotiveKey, p }))
+    .sort((a, b) => b.p - a.p)
+}
+
 function record(world: World, agent: Agent, rec: DecisionRecord) {
   agent.decisions.push(rec)
   if (agent.decisions.length > DECISIONS_KEEP) agent.decisions.shift()
@@ -790,6 +1340,14 @@ function answerError(world: World, agent: Agent, message: string) {
   world.stats.errors += 1
   log(world, `Unusable JEV answer for ${agent.persona.name}: ${message}`, [agent.id], "error")
   becomeIdle(world, agent, ERROR_BACKOFF_TICKS)
+}
+
+function tallyDrivers(world: World, agent: Agent, drivers: DriverKey[]) {
+  const share = 1 / Math.max(1, drivers.length)
+  for (const d of drivers) {
+    agent.drivers[d] = (agent.drivers[d] ?? 0) + share
+    count(world, `driver_${d}`, share)
+  }
 }
 
 function applyDecision(world: World, agent: Agent, ans: JevAnswer, mode: ChoiceMode) {
@@ -810,15 +1368,17 @@ function applyDecision(world: World, agent: Agent, ans: JevAnswer, mode: ChoiceM
     tick: world.tick,
     kind: "decide",
     state: ans.state,
-    options: options
-      .map((o) => ({ id: o.id, label: o.label, p: known[o.id] ?? 0 }))
-      .sort((a, b) => b.p - a.p),
+    options: options.map((o) => ({ id: o.id, label: o.label, p: known[o.id] ?? 0 })).sort((a, b) => b.p - a.p),
     picked: picked.id,
     pickedLabel: picked.label,
     mode,
     latencyMs: ans.latencyMs,
+    motive: readMotive(ans.answers.motive),
+    confidence: ans.confidence.action ?? null,
+    drivers: picked.drivers,
   })
   count(world, `picked_${picked.intent.kind}`)
+  tallyDrivers(world, agent, picked.drivers)
 
   if (picked.intent.kind === "talk") {
     const target = agentById(world, picked.intent.targetId)
@@ -856,6 +1416,9 @@ function applyResponse(world: World, target: Agent, ans: JevAnswer, mode: Choice
     pickedLabel: engage ? "Stopped to chat" : "Declined",
     mode,
     latencyMs: ans.latencyMs,
+    motive: null,
+    confidence: ans.confidence.engage ?? null,
+    drivers: engage ? ["belonging"] : [],
   })
 
   if (!asker || asker.status.kind !== "asking") {
@@ -877,7 +1440,7 @@ function applyResponse(world: World, target: Agent, ans: JevAnswer, mode: Choice
     becomeIdle(world, asker)
     remember(world, asker, `${target.persona.name} did not want to chat with you.`)
     remember(world, target, `You turned down a chat with ${asker.persona.name}.`)
-    nudgeAffinity(asker, target.id, -0.2)
+    nudgeAffinity(asker, target.id, -0.1)
     flash(world, asker, "angry")
     log(world, `${target.persona.name} turned down ${asker.persona.name}.`, [asker.id, target.id], "social")
   }
@@ -939,6 +1502,17 @@ export function intervene(world: World, iv: Intervention) {
       for (const bush of world.bushes) bush.berries = BERRY_MAX
       log(world, "Observer: every berry bush is suddenly heavy with fruit.", [], "info")
       break
+    case "drain_store":
+      world.store.food = 0
+      log(world, "Observer: the village store is found empty.", [], "error")
+      break
+    case "fill_store":
+      world.store.food += 12
+      log(world, "Observer: a traveller leaves 12 food in the village store.", [], "info")
+      break
   }
   count(world, `intervention_${iv.kind}`)
 }
+
+/** Body needs first, then the needs of the mind; exported for the UI. */
+export const NEED_GROUPS = { body: BODY_KEYS, mind: NEED_KEYS.filter((k) => !(BODY_KEYS as readonly string[]).includes(k)) }

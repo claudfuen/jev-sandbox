@@ -1,4 +1,5 @@
-import type { Bush, House, Landmark, Poi, Tile, Vec } from "./types"
+import { HOUSEHOLDS } from "./personas"
+import type { Bush, House, Landmark, Poi, Project, Store, Tile, Vec } from "./types"
 
 export const MAP_W = 32
 export const MAP_H = 20
@@ -7,7 +8,7 @@ export const TILE = 16
 export const HOUSE_W = 4
 export const HOUSE_H = 3
 
-const WALKABLE: ReadonlySet<Tile> = new Set(["grass", "tallgrass", "flowers", "path", "sand", "door"])
+const WALKABLE: ReadonlySet<Tile> = new Set<Tile>(["grass", "tallgrass", "flowers", "path", "sand", "door"])
 
 export const idx = (x: number, y: number) => y * MAP_W + x
 export const inBounds = (x: number, y: number) => x >= 0 && y >= 0 && x < MAP_W && y < MAP_H
@@ -27,15 +28,21 @@ type MapData = {
   pois: Poi[]
   landmarks: Landmark[]
   campfire: Vec
+  project: Project
+  store: Store
 }
 
-// Owners map to persona ids in personas.ts.
-const HOUSES: { ownerId: string; x: number; y: number }[] = [
-  { ownerId: "pip", x: 3, y: 2 },
-  { ownerId: "bram", x: 8, y: 2 },
-  { ownerId: "mo", x: 20, y: 2 },
-  { ownerId: "juniper", x: 25, y: 2 },
+/** House footprints, in the same order as HOUSEHOLDS. */
+const HOUSE_SPOTS: Vec[] = [
+  { x: 3, y: 2 },
+  { x: 8, y: 2 },
+  { x: 20, y: 2 },
+  { x: 25, y: 2 },
+  { x: 2, y: 7 },
+  { x: 24, y: 7 },
 ]
+
+export const STORE_START_FOOD = 12
 
 export function buildMap(): MapData {
   const tiles: Tile[] = new Array(MAP_W * MAP_H).fill("grass")
@@ -77,20 +84,36 @@ export function buildMap(): MapData {
 
   // Scattered trees and rocks.
   const trees: [number, number][] = [
-    [11, 7], [12, 7], [11, 8], [23, 8], [24, 8], [2, 17], [3, 18], [19, 16], [19, 17],
-    [29, 2], [29, 3], [1, 7], [1, 8], [20, 8], [6, 7], [26, 18], [14, 18],
+    [11, 7], [12, 7], [11, 8], [2, 17], [3, 18], [19, 16], [19, 17],
+    [29, 2], [29, 3], [1, 7], [1, 8], [21, 8], [6, 8], [26, 18], [14, 18],
   ]
   for (const [x, y] of trees) set(x, y, "tree")
-  set(26, 9, "rock")
-  set(5, 8, "rock")
+  set(29, 10, "rock")
+  set(7, 9, "rock")
 
-  // Houses: 4x3 footprint, door in the bottom row.
-  const houses: House[] = HOUSES.map(({ ownerId, x, y }) => {
+  // Houses: 4x3 footprint, door in the bottom row. Households share a house.
+  const houses: House[] = HOUSE_SPOTS.map(({ x, y }, i) => {
     rect(x, y, x + HOUSE_W - 1, y + HOUSE_H - 1, "house")
     const door = { x: x + 1, y: y + HOUSE_H - 1 }
     set(door.x, door.y, "door")
-    return { id: `house_${ownerId}`, ownerId, x, y, door }
+    return { id: `house_${i + 1}`, residents: [...(HOUSEHOLDS[i] ?? [])], x, y, door }
   })
+
+  // The granary: a shared build site beside the main street.
+  const project: Project = {
+    id: "granary",
+    name: "the granary",
+    pos: { x: 18, y: 6 },
+    size: { x: 3, y: 2 },
+    sessionsDone: 0,
+    sessionsNeeded: 12,
+    contributors: {},
+    doneAt: null,
+  }
+  rect(project.pos.x, project.pos.y, project.pos.x + project.size.x - 1, project.pos.y + project.size.y - 1, "site")
+
+  // The village store: a communal basket in the plaza.
+  const store: Store = { pos: { x: 17, y: 10 }, food: STORE_START_FOOD, nextSpoil: 0 }
 
   // Berry grove west of the plaza.
   const bushPositions: Vec[] = [
@@ -106,6 +129,7 @@ export function buildMap(): MapData {
 
   const campfire = { x: 15, y: 10 }
   set(campfire.x, campfire.y, "campfire")
+  set(store.pos.x, store.pos.y, "store")
   set(15, 17, "well")
   set(28, 8, "sign")
 
@@ -119,10 +143,11 @@ export function buildMap(): MapData {
   const landmarks: Landmark[] = [
     ...houses.map((h) => ({
       name: "house",
-      ownerId: h.ownerId,
+      houseId: h.id,
       center: { x: h.door.x, y: h.door.y + 1 },
       radius: 2,
     })),
+    { name: "the granary build site", center: { x: 19, y: 8 }, radius: 2 },
     { name: "the flower meadow", center: { x: 15, y: 2 }, radius: 3 },
     { name: "the campfire in the plaza", center: campfire, radius: 3 },
     { name: "the berry grove", center: { x: 5, y: 13 }, radius: 4 },
@@ -133,5 +158,5 @@ export function buildMap(): MapData {
     { name: "the main street", center: { x: 15, y: 5 }, radius: 14 },
   ]
 
-  return { tiles, houses, bushes, pois, landmarks, campfire }
+  return { tiles, houses, bushes, pois, landmarks, campfire, project, store }
 }

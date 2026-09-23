@@ -104,9 +104,21 @@ export type Stats = {
   costUsd: number
 }
 
+export type WorldConfig = { seed: number; scenario: string }
+
+/** Observer interventions. Recorded with the run so replays reproduce them. */
+export type Intervention =
+  | { kind: "famine" }
+  | { kind: "bounty" }
+
 export type World = {
+  config: WorldConfig
   tick: number
   rng: number
+  /** Monotonic id for JEV requests; deterministic, so replays can match answers. */
+  requestSeq: number
+  /** Cumulative event counts used by metrics (chats, declines, meals...). */
+  counters: Record<string, number>
   tiles: Tile[]
   houses: House[]
   bushes: Bush[]

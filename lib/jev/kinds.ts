@@ -1,0 +1,26 @@
+import type { Experimental_EvaluationQuestion as EvaluationQuestion } from "ai"
+
+import { buildState, decideQuestions, respondQuestions } from "./prompt"
+import type { JevRequest } from "./schema"
+
+export type JevCall = { state: string; questions: Record<string, EvaluationQuestion> }
+
+/**
+ * Pure: the exact state text and typed questions for a request. Used by the
+ * route, the lab runner, and replay (which recomputes "what JEV saw" instead of
+ * storing it).
+ */
+export function buildJevCall(req: JevRequest): JevCall {
+  switch (req.kind) {
+    case "decide":
+      return {
+        state: buildState(req.payload.perception),
+        questions: decideQuestions(req.payload.perception, req.payload.options),
+      }
+    case "respond":
+      return {
+        state: buildState(req.payload.perception),
+        questions: respondQuestions(req.payload.perception, req.payload.askerName),
+      }
+  }
+}

@@ -40,23 +40,30 @@ export const optionSchema = z.object({
   detail: z.string().max(200),
 })
 
+export const decidePayloadSchema = z.object({
+  perception: perceptionSchema,
+  options: z.array(optionSchema).min(2).max(64),
+})
+
+export const respondPayloadSchema = z.object({
+  perception: perceptionSchema,
+  askerName: z.string().min(1).max(40),
+})
+
+/**
+ * Every JEV call kind the sim can make. Add a kind here, give it a state and
+ * question builder in kinds.ts, and interpret its answers in the engine.
+ */
 export const jevRequestSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("decide"),
-    perception: perceptionSchema,
-    options: z.array(optionSchema).min(2).max(24),
-  }),
-  z.object({
-    kind: z.literal("respond"),
-    perception: perceptionSchema,
-    askerName: z.string().min(1).max(40),
-  }),
+  z.object({ kind: z.literal("decide"), payload: decidePayloadSchema }),
+  z.object({ kind: z.literal("respond"), payload: respondPayloadSchema }),
 ])
 
 export type Needs = z.infer<typeof needsSchema>
 export type Perception = z.infer<typeof perceptionSchema>
 export type WireOption = z.infer<typeof optionSchema>
 export type JevRequest = z.infer<typeof jevRequestSchema>
+export type JevKind = JevRequest["kind"]
 
 export type MoodReading = {
   level: number
@@ -64,22 +71,18 @@ export type MoodReading = {
   probabilities: number[]
 }
 
-type JevMeta = {
+/** One JEV answer, normalized so every question type has a predictable shape. */
+export type RawAnswer =
+  | { type: "choice"; choice: string; probabilities: Record<string, number> }
+  | { type: "boolean"; probability: number }
+  | { type: "score"; score: number; probabilities: Record<string, number> }
+
+/** What the route (or the lab runner) returns for any kind. */
+export type JevAnswer = {
+  kind: JevKind
   state: string
-  mood: MoodReading | null
+  answers: Record<string, RawAnswer>
+  confidence: Record<string, number>
   latencyMs: number
   costUsd: number | null
 }
-
-export type DecideResponse = JevMeta & {
-  kind: "decide"
-  choice: string
-  probabilities: Record<string, number>
-}
-
-export type RespondResponse = JevMeta & {
-  kind: "respond"
-  engageProbability: number
-}
-
-export type JevResponse = DecideResponse | RespondResponse

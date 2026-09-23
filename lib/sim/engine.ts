@@ -1,11 +1,5 @@
-import type {
-  DecideResponse,
-  JevRequest,
-  NeedKey,
-  Perception,
-  RespondResponse,
-} from "@/lib/jev/schema"
-import { NEED_KEYS } from "@/lib/jev/schema"
+import type { JevAnswer, JevRequest, MoodReading, NeedKey, Perception, RawAnswer } from "@/lib/jev/schema"
+import { MOOD_LEVELS, NEED_KEYS } from "@/lib/jev/schema"
 
 import { clockOf, formatClock, formatTime, isNight } from "./clock"
 import {
@@ -26,10 +20,12 @@ import type {
   ChoiceMode,
   DecisionRecord,
   Intent,
+  Intervention,
   OptionSpec,
   Status,
   Vec,
   World,
+  WorldConfig,
 } from "./types"
 
 // ---------------------------------------------------------------------------
@@ -76,7 +72,10 @@ function nextRandom(world: World): number {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296
 }
 
-export function createWorld(seed = 7): World {
+export const DEFAULT_CONFIG: WorldConfig = { seed: 7, scenario: "village" }
+
+export function createWorld(config: Partial<WorldConfig> = {}): World {
+  const cfg: WorldConfig = { ...DEFAULT_CONFIG, ...config }
   const map = buildMap()
   const agents: Agent[] = PERSONAS.map((persona) => {
     const house = map.houses.find((h) => h.ownerId === persona.id)
@@ -103,8 +102,11 @@ export function createWorld(seed = 7): World {
     }
   })
   return {
+    config: cfg,
     tick: 0,
-    rng: seed,
+    rng: cfg.seed,
+    requestSeq: 0,
+    counters: {},
     ...map,
     agents,
     log: [{ tick: 0, text: "A new day begins in the village.", agentIds: [], tone: "info" }],
@@ -133,6 +135,10 @@ function remember(world: World, agent: Agent, text: string) {
 function log(world: World, text: string, agentIds: string[], tone: "info" | "social" | "error" = "info") {
   world.log.push({ tick: world.tick, text, agentIds, tone })
   if (world.log.length > LOG_KEEP) world.log.shift()
+}
+
+export function count(world: World, key: string, n = 1) {
+  world.counters[key] = (world.counters[key] ?? 0) + n
 }
 
 function flash(world: World, agent: Agent, kind: NonNullable<Agent["flash"]>["kind"], ticks = 6) {
@@ -507,6 +513,7 @@ function arrive(world: World, agent: Agent, intent: Intent) {
 function finishActing(world: World, agent: Agent, intent: Intent) {
   switch (intent.kind) {
     case "eat":
+      count(world, "meals")
       remember(world, agent, "You ate berries in the grove.")
       log(world, `${agent.persona.name} ate some berries.`, [agent.id])
       break
@@ -515,6 +522,7 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
       break
     case "explore": {
       const name = world.pois.find((p) => p.id === intent.poiId)?.name ?? "somewhere"
+      count(world, "explorations")
       remember(world, agent, `You explored ${name}.`)
       log(world, `${agent.persona.name} explored ${name}.`, [agent.id])
       break
@@ -543,6 +551,7 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
 }
 
 function giveUpTalk(world: World, agent: Agent, targetId: string, reason: string) {
+  count(world, "chat_give_ups")
   remember(world, agent, reason)
   flash(world, agent, "sweat")
   log(world, `${agent.persona.name} gave up on talking to ${nameOf(world, targetId)}.`, [agent.id, targetId])
@@ -555,7 +564,7 @@ function startAsking(world: World, agent: Agent, target: Agent): SimRequest {
   agent.status = { kind: "asking", targetId: target.id, since: world.tick }
   target.status = { kind: "considering", askerId: agent.id, resume: target.status, since: world.tick }
   flash(world, agent, "exclaim", 4)
-  return { kind: "respond", agentId: target.id, askerId: agent.id, perception: perceive(world, target, agent) }
+  return issue(world, { kind: "respond", agentId: target.id, askerId: agent.id, perception: perceive(world, target, agent) })
 }
 
 function chase(world: World, agent: Agent, status: Extract<Status, { kind: "moving" }>, targetId: string): SimRequest | null {
@@ -597,9 +606,21 @@ function moveTo(agent: Agent, next: Vec) {
 // ---------------------------------------------------------------------------
 // Tick
 
+type RequestBase = { id: number; tick: number; agentId: string; perception: Perception }
 export type SimRequest =
+  | (RequestBase & { kind: "decide"; options: OptionSpec[] })
+  | (RequestBase & { kind: "respond"; askerId: string })
+
+type RequestInit =
   | { kind: "decide"; agentId: string; perception: Perception; options: OptionSpec[] }
   | { kind: "respond"; agentId: string; askerId: string; perception: Perception }
+
+/** Every JEV request gets a deterministic id so recorded answers can be matched on replay. */
+function issue(world: World, init: RequestInit): SimRequest {
+  world.requestSeq += 1
+  world.stats.calls += 1
+  return { ...init, id: world.requestSeq, tick: world.tick } as SimRequest
+}
 
 function decayNeeds(world: World, agent: Agent) {
   const night = isNight(world.tick)
@@ -651,7 +672,7 @@ function regrowBerries(world: World) {
   }
 }
 
-export function step(world: World, opts: { allowDecisions: boolean }): SimRequest[] {
+export function step(world: World): SimRequest[] {
   world.tick += 1
   const requests: SimRequest[] = []
   regrowBerries(world)
@@ -666,10 +687,10 @@ export function step(world: World, opts: { allowDecisions: boolean }): SimReques
     const s = agent.status
     switch (s.kind) {
       case "idle":
-        if (opts.allowDecisions && world.tick >= s.retryAt) {
+        if (world.tick >= s.retryAt) {
           const options = buildOptions(world, agent)
           agent.status = { kind: "deciding", since: world.tick, options }
-          requests.push({ kind: "decide", agentId: agent.id, perception: perceive(world, agent), options })
+          requests.push(issue(world, { kind: "decide", agentId: agent.id, perception: perceive(world, agent), options }))
         }
         break
       case "deciding":
@@ -748,46 +769,56 @@ function pickFrom(world: World, probabilities: Record<string, number>, fallback:
   return entries[entries.length - 1][0]
 }
 
+export function readMood(answer: RawAnswer | undefined): MoodReading | null {
+  if (!answer || answer.type !== "score") return null
+  const probabilities = MOOD_LEVELS.map((_, i) => answer.probabilities[String(i)] ?? 0)
+  const level = Math.max(0, Math.min(MOOD_LEVELS.length - 1, Math.round(answer.score)))
+  return { level, label: MOOD_LEVELS[level], probabilities }
+}
+
 function record(world: World, agent: Agent, rec: DecisionRecord) {
   agent.decisions.push(rec)
   if (agent.decisions.length > DECISIONS_KEEP) agent.decisions.shift()
 }
 
-function track(world: World, res: { latencyMs: number; costUsd: number | null }) {
-  world.stats.totalLatencyMs += res.latencyMs
-  world.stats.costUsd += res.costUsd ?? 0
+function track(world: World, ans: JevAnswer) {
+  world.stats.totalLatencyMs += ans.latencyMs
+  world.stats.costUsd += ans.costUsd ?? 0
 }
 
-export function applyDecision(world: World, agentId: string, res: DecideResponse, mode: ChoiceMode) {
-  const agent = agentById(world, agentId)
-  if (!agent || agent.status.kind !== "deciding") return
-  const { options } = agent.status
-  world.stats.decisions += 1
-  track(world, res)
-  agent.mood = res.mood
+function answerError(world: World, agent: Agent, message: string) {
+  world.stats.errors += 1
+  log(world, `Unusable JEV answer for ${agent.persona.name}: ${message}`, [agent.id], "error")
+  becomeIdle(world, agent, ERROR_BACKOFF_TICKS)
+}
 
-  const known = Object.fromEntries(options.map((o) => [o.id, res.probabilities[o.id] ?? 0]))
-  const pickedId = pickFrom(world, known, res.choice, mode)
-  const picked = options.find((o) => o.id === pickedId) ?? options.find((o) => o.id === res.choice)
-  if (!picked) {
-    world.stats.errors += 1
-    log(world, `JEV picked an unknown option for ${agent.persona.name}: ${res.choice}`, [agentId], "error")
-    becomeIdle(world, agent, ERROR_BACKOFF_TICKS)
-    return
-  }
+function applyDecision(world: World, agent: Agent, ans: JevAnswer, mode: ChoiceMode) {
+  if (agent.status.kind !== "deciding") return
+  const { options } = agent.status
+  const action = ans.answers.action
+  if (!action || action.type !== "choice") return answerError(world, agent, "missing action choice")
+  world.stats.decisions += 1
+  track(world, ans)
+  agent.mood = readMood(ans.answers.mood)
+
+  const known = Object.fromEntries(options.map((o) => [o.id, action.probabilities[o.id] ?? 0]))
+  const pickedId = pickFrom(world, known, action.choice, mode)
+  const picked = options.find((o) => o.id === pickedId) ?? options.find((o) => o.id === action.choice)
+  if (!picked) return answerError(world, agent, `unknown option ${action.choice}`)
 
   record(world, agent, {
     tick: world.tick,
     kind: "decide",
-    state: res.state,
+    state: ans.state,
     options: options
       .map((o) => ({ id: o.id, label: o.label, p: known[o.id] ?? 0 }))
       .sort((a, b) => b.p - a.p),
     picked: picked.id,
     pickedLabel: picked.label,
     mode,
-    latencyMs: res.latencyMs,
+    latencyMs: ans.latencyMs,
   })
+  count(world, `picked_${picked.intent.kind}`)
 
   if (picked.intent.kind === "talk") {
     const target = agentById(world, picked.intent.targetId)
@@ -796,21 +827,27 @@ export function applyDecision(world: World, agentId: string, res: DecideResponse
   startIntent(world, agent, picked.intent)
 }
 
-export function applyResponse(world: World, agentId: string, res: RespondResponse, mode: ChoiceMode) {
-  const target = agentById(world, agentId)
-  if (!target || target.status.kind !== "considering") return
+function applyResponse(world: World, target: Agent, ans: JevAnswer, mode: ChoiceMode) {
+  if (target.status.kind !== "considering") return
   const { askerId, resume } = target.status
   const asker = agentById(world, askerId)
+  const engageAnswer = ans.answers.engage
+  if (!engageAnswer || engageAnswer.type !== "boolean") {
+    target.status = resume
+    if (asker?.status.kind === "asking") becomeIdle(world, asker, ERROR_BACKOFF_TICKS)
+    world.stats.errors += 1
+    return
+  }
   world.stats.responses += 1
-  track(world, res)
-  target.mood = res.mood
+  track(world, ans)
+  target.mood = readMood(ans.answers.mood)
 
-  const p = res.engageProbability
+  const p = engageAnswer.probability
   const engage = mode === "sample" ? nextRandom(world) < p : p >= 0.5
   record(world, target, {
     tick: world.tick,
     kind: "respond",
-    state: res.state,
+    state: ans.state,
     options: [
       { id: "yes", label: `Stop and chat with ${asker?.persona.name ?? "them"}`, p },
       { id: "no", label: "Keep doing what you were doing", p: 1 - p },
@@ -818,7 +855,7 @@ export function applyResponse(world: World, agentId: string, res: RespondRespons
     picked: engage ? "yes" : "no",
     pickedLabel: engage ? "Stopped to chat" : "Declined",
     mode,
-    latencyMs: res.latencyMs,
+    latencyMs: ans.latencyMs,
   })
 
   if (!asker || asker.status.kind !== "asking") {
@@ -827,6 +864,7 @@ export function applyResponse(world: World, agentId: string, res: RespondRespons
   }
 
   if (engage) {
+    count(world, "chats")
     asker.status = { kind: "chatting", partnerId: target.id, ticksLeft: CHAT_TICKS }
     target.status = { kind: "chatting", partnerId: asker.id, ticksLeft: CHAT_TICKS }
     flash(world, asker, "heart", CHAT_TICKS)
@@ -834,6 +872,7 @@ export function applyResponse(world: World, agentId: string, res: RespondRespons
     nudgeAffinity(target, asker.id, 0.05)
     log(world, `${target.persona.name} happily stopped to chat with ${asker.persona.name}.`, [asker.id, target.id], "social")
   } else {
+    count(world, "declines")
     target.status = resume
     becomeIdle(world, asker)
     remember(world, asker, `${target.persona.name} did not want to chat with you.`)
@@ -841,6 +880,18 @@ export function applyResponse(world: World, agentId: string, res: RespondRespons
     nudgeAffinity(asker, target.id, -0.2)
     flash(world, asker, "angry")
     log(world, `${target.persona.name} turned down ${asker.persona.name}.`, [asker.id, target.id], "social")
+  }
+}
+
+/** The single entry point for JEV answers, live or replayed. */
+export function applyAnswer(world: World, req: SimRequest, ans: JevAnswer, mode: ChoiceMode) {
+  const agent = agentById(world, req.agentId)
+  if (!agent) return
+  switch (req.kind) {
+    case "decide":
+      return applyDecision(world, agent, ans, mode)
+    case "respond":
+      return applyResponse(world, agent, ans, mode)
   }
 }
 
@@ -863,9 +914,31 @@ export function toWire(world: World, req: SimRequest): JevRequest {
   if (req.kind === "decide") {
     return {
       kind: "decide",
-      perception: req.perception,
-      options: req.options.map(({ id, label, detail }) => ({ id, label, detail })),
+      payload: {
+        perception: req.perception,
+        options: req.options.map(({ id, label, detail }) => ({ id, label, detail })),
+      },
     }
   }
-  return { kind: "respond", perception: req.perception, askerName: nameOf(world, req.askerId) }
+  return { kind: "respond", payload: { perception: req.perception, askerName: nameOf(world, req.askerId) } }
+}
+
+// ---------------------------------------------------------------------------
+// Interventions
+
+export function intervene(world: World, iv: Intervention) {
+  switch (iv.kind) {
+    case "famine":
+      for (const bush of world.bushes) {
+        bush.berries = 0
+        bush.nextRegrow = world.tick + BERRY_REGROW_TICKS * 3
+      }
+      log(world, "Observer: a blight strips every berry bush bare.", [], "error")
+      break
+    case "bounty":
+      for (const bush of world.bushes) bush.berries = BERRY_MAX
+      log(world, "Observer: every berry bush is suddenly heavy with fruit.", [], "info")
+      break
+  }
+  count(world, `intervention_${iv.kind}`)
 }

@@ -3,10 +3,9 @@ import { readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
-// Server-only. Resolves the Vercel AI Gateway key the same way the assistant
-// repo's JEV tooling does: env, then macOS Keychain, then an owner-only file.
-// On Vercel, the Gateway authenticates with the OIDC token instead.
-// The key is never logged or returned to the client.
+// Server-only. Resolves the Vercel AI Gateway key: env (on Vercel this is the
+// project's budgeted jev-sandbox key), then macOS Keychain, then an owner-only
+// file, then the project's OIDC token. The key is never logged or returned.
 
 function fromKeychain(): string | null {
   if (process.platform !== "darwin") return null
@@ -33,12 +32,15 @@ function fromFile(): string | null {
 }
 
 export function ensureGatewayKey(): void {
-  if (process.env.AI_GATEWAY_API_KEY?.trim() || process.env.VERCEL_OIDC_TOKEN) return
+  if (process.env.AI_GATEWAY_API_KEY?.trim()) return
   const key = fromKeychain() ?? fromFile()
-  if (!key) {
-    throw new Error(
-      "No AI Gateway key. Set AI_GATEWAY_API_KEY in .env.local, or store it in the macOS Keychain under service AI_GATEWAY_API_KEY.",
-    )
+  if (key) {
+    process.env.AI_GATEWAY_API_KEY = key
+    return
   }
-  process.env.AI_GATEWAY_API_KEY = key
+  // On Vercel, or locally after `vercel env pull`, the Gateway authenticates with OIDC.
+  if (process.env.VERCEL || process.env.VERCEL_OIDC_TOKEN) return
+  throw new Error(
+    "No AI Gateway key. Set AI_GATEWAY_API_KEY, store it in the macOS Keychain under service AI_GATEWAY_API_KEY, or run `vercel env pull`.",
+  )
 }

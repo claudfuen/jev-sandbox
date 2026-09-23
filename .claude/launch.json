@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jev-sandbox",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["--cwd", "/Users/claudiofuentes/Repos/jev-sandbox", "run", "dev", "--port", "3317"],
+      "port": 3317
+    }
+  ]
+}

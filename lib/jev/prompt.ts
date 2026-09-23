@@ -5,9 +5,11 @@ import {
   MOTIVES,
   NEED_KEYS,
   type NeedKey,
+  type OfferWire,
   type Perception,
   type WireOption,
 } from "./schema"
+import type { Experimental_EvaluationQuestion as EvaluationQuestion } from "ai"
 import type { z } from "zod"
 import type { assessPayloadSchema } from "./schema"
 
@@ -17,7 +19,7 @@ const NEED_WORDS: Record<NeedKey, readonly [string, string, string, string, stri
   hunger: ["starving", "very hungry", "a bit peckish", "satisfied", "full"],
   thirst: ["parched", "very thirsty", "a little thirsty", "fine", "well hydrated"],
   energy: ["exhausted", "tired", "okay", "rested", "full of energy"],
-  health: ["collapsing", "ill", "unwell", "fine", "healthy"],
+  health: ["collapsing", "very weak", "weakening", "slightly weakened", "healthy"],
   social: ["very lonely", "lonely", "fine", "connected", "socially full"],
   fun: ["bored stiff", "bored", "fine", "entertained", "delighted"],
   purpose: ["aimless", "drifting", "okay", "purposeful", "fulfilled"],
@@ -37,11 +39,22 @@ export const NEED_NAMES: Record<NeedKey, string> = {
 
 /** Honest physical consequences, so bodily urgency is not drowned out by personality words. */
 function urgency(key: NeedKey, value: number): string | null {
-  if (key === "hunger" && value < 15) return "you feel faint; if you go much longer without food your health will start to fail"
-  if (key === "thirst" && value < 15) return "your mouth is dry and your head aches; without water your health will start to fail"
+  if (key === "hunger" && value < 15) return "you are starving; your body is failing and you will collapse without food"
+  if (key === "hunger" && value < 25) return "you are getting faint from hunger and need to eat soon"
+  if (key === "thirst" && value < 15) return "you are badly dehydrated; your body is failing and you will collapse without water"
+  if (key === "thirst" && value < 25) return "you are dehydrated and need water soon"
   if (key === "energy" && value < 10) return "you can barely keep your eyes open"
-  if (key === "health" && value < 40) return "you are getting weak and could collapse"
   return null
+}
+
+/** One plain sentence when the body is in real trouble, placed above everything else about needs. */
+function bodyAlarm(p: Perception): string | null {
+  const parts: string[] = []
+  if (p.needs.thirst < 25) parts.push("you badly need water")
+  if (p.needs.hunger < 25) parts.push("you badly need food")
+  if (p.needs.health < 85) parts.push(`your health is ${Math.round(p.needs.health)}/100 and falling`)
+  if (!parts.length) return null
+  return `Your body needs attention: ${parts.join(", ")}.`
 }
 
 export function needWord(key: NeedKey, value: number): string {
@@ -71,6 +84,7 @@ export function buildState(p: Perception): string {
     `Where you are: ${p.location}.`,
     "",
     "How you feel right now (100 = fully satisfied, 0 = desperate):",
+    ...(bodyAlarm(p) ? [bodyAlarm(p)!] : []),
     needs,
     "",
     "What you notice:",
@@ -107,15 +121,86 @@ export function decideQuestions(p: Perception, options: WireOption[]) {
   } as const
 }
 
-export function respondQuestions(p: Perception, askerName: string) {
-  return {
-    engage: {
-      type: "boolean",
-      instructions: `${askerName} just walked up to ${p.name} and wants to stop and chat. Given who ${p.name} is, how they feel right now and what they were doing, does ${p.name} actually stop to chat with ${askerName}?`,
-    },
-    mood: moodQuestion(p.name),
-  } as const
+/** The reply options for each kind of offer, from the approached villager's side. */
+export function replyCriteria(offer: OfferWire, can: { food: number; coins: number }, askerName: string): Record<string, string> {
+  switch (offer.kind) {
+    case "chat":
+      return {}
+    case "gift_food":
+    case "gift_coins": {
+      const what = offer.kind === "gift_food" ? `${offer.n} food` : `${offer.n} coins`
+      return {
+        thank: `Accept the ${what} gratefully and thank ${askerName} warmly`,
+        accept: `Accept the ${what} without making a fuss`,
+        refuse: `Refuse the gift`,
+      }
+    }
+    case "ask_food": {
+      const c: Record<string, string> = {}
+      if (can.food > 0) c.give_food = `Give ${askerName} 1 of your ${can.food} food`
+      if (can.coins >= 2) c.give_coins = `Give ${askerName} 2 of your ${can.coins} coins to buy food`
+      c.refuse = `Refuse and keep what you have`
+      return c
+    }
+    case "lend":
+      return {
+        accept: `Borrow the ${offer.amount} coins and owe ${askerName} ${offer.owed} by tomorrow evening`,
+        refuse: "Decline the loan",
+      }
+    case "demand_repay": {
+      const c: Record<string, string> = {}
+      if (can.coins >= offer.owed) c.repay = `Pay ${askerName} the ${offer.owed} coins you owe now`
+      c.promise = "Promise to pay later"
+      c.refuse = "Refuse to pay"
+      return c
+    }
+  }
 }
+
+function offerSentence(offer: OfferWire, askerName: string): string {
+  switch (offer.kind) {
+    case "chat":
+      return `${askerName} just walked up and wants to stop and chat.`
+    case "gift_food":
+      return `${askerName} just walked up and is offering you ${offer.n} food as a gift.`
+    case "gift_coins":
+      return `${askerName} just walked up and is offering you ${offer.n} coins as a gift.`
+    case "ask_food":
+      return `${askerName} just walked up, says they have not eaten properly in a long time, and begs you for something to eat.`
+    case "lend":
+      return `${askerName} just walked up and offers to lend you ${offer.amount} coins, to be paid back as ${offer.owed} coins by tomorrow evening.`
+    case "demand_repay":
+      return `${askerName} just walked up and, in front of anyone nearby, demands the ${offer.owed} coins you owe them.`
+  }
+}
+
+export function respondQuestions(
+  p: Perception,
+  askerName: string,
+  offer: OfferWire,
+  can: { food: number; coins: number },
+): Record<string, EvaluationQuestion> {
+  const mood = moodQuestion(p.name)
+  if (offer.kind === "chat") {
+    return {
+      engage: {
+        type: "boolean",
+        instructions: `${askerName} just walked up to ${p.name} and wants to stop and chat. Given who ${p.name} is, how they feel right now and what they were doing, does ${p.name} actually stop to chat with ${askerName}?`,
+      },
+      mood,
+    }
+  }
+  return {
+    reply: {
+      type: "choice",
+      instructions: `${offerSentence(offer, askerName)} Given who ${p.name} is, how they feel about ${askerName}, their own situation and what they know, how does ${p.name} actually respond?`,
+      criteria: replyCriteria(offer, can, askerName),
+    },
+    mood,
+  }
+}
+
+export { offerSentence }
 
 // ---------------------------------------------------------------------------
 // Assessment: JEV's estimate of whether a run is interesting to the owner.

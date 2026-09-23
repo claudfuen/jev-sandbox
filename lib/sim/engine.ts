@@ -1,4 +1,5 @@
-import type { JevAnswer, JevRequest, MoodReading, MotiveKey, NeedKey, Perception, RawAnswer } from "@/lib/jev/schema"
+import type { JevAnswer, JevRequest, MoodReading, MotiveKey, NeedKey, OfferWire, Perception, RawAnswer } from "@/lib/jev/schema"
+import { replyCriteria } from "@/lib/jev/prompt"
 import { BODY_KEYS, MOOD_LEVELS, NEED_KEYS } from "@/lib/jev/schema"
 
 import { clockOf, formatClock, formatTime, isNight } from "./clock"
@@ -15,6 +16,7 @@ import {
 } from "./geometry"
 import { buildMap, idx, isWalkable, MAP_W, tileAt } from "./map"
 import { FOUNDING_AFFINITY, PERSONAS } from "./personas"
+import { habit, lifeEvent } from "./drift"
 import { needRates, psycheLines } from "./psyche"
 import type {
   Agent,
@@ -26,6 +28,7 @@ import type {
   Intent,
   Intervention,
   LogEntry,
+  Offer,
   OptionSpec,
   Status,
   Vec,
@@ -62,6 +65,9 @@ const CARRY_CAP = 4
 const WITNESS_RADIUS = 6
 const STORE_SPOIL_TICKS = 72
 const STORE_SAFE_WITHOUT_GRANARY = 6
+const LOAN_GRACE_TICKS = 144
+const LIE_MEMORY_TICKS = 96
+const PICKPOCKET_MAX = 3
 const MEAL_START = 18 * 60
 const MEAL_END = 19 * 60 + 30
 
@@ -79,9 +85,13 @@ const ACT_TICKS = {
   meal: 3,
   take_store: 1,
   eat_carry: 2,
-} satisfies Record<Exclude<Intent["kind"], "sleep" | "talk">, number>
+  buy: 1,
+  sell: 1,
+  set_price: 10,
+} satisfies Record<Exclude<Intent["kind"], "sleep" | "approach">, number>
 const CHAT_TICKS = 6
 const COLLAPSE_TICKS = 36
+const HEALTH_LOSS = 0.35
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -119,6 +129,10 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
       needs: { ...persona.start },
       needCause: {},
       carry: 0,
+      coins: persona.coins,
+      drift: [],
+      driftToday: { day: 1, used: {} },
+      missingCoins: 0,
       status: { kind: "idle", retryAt: 0 },
       memory: [{ tick: 0, text: "You woke up and stepped outside your house." }],
       affinity,
@@ -137,6 +151,8 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
     requestSeq: 0,
     counters: {},
     ...map,
+    debts: [],
+    lies: [],
     agents,
     log: [{ tick: 0, text: "A new day begins in the village.", agentIds: [], tone: "info" }],
     stats: { calls: 0, decisions: 0, responses: 0, errors: 0, totalLatencyMs: 0, costUsd: 0 },
@@ -194,6 +210,8 @@ const touchesWater = (world: World, p: Vec) => neighbors(p).some((n) => isWater(
 const nearCampfire = (world: World, p: Vec) =>
   Math.abs(p.x - world.campfire.x) <= 1 && Math.abs(p.y - world.campfire.y) <= 1 && !sameTile(p, world.campfire)
 const atStore = (world: World, p: Vec) => adjacent(p, world.store.pos)
+const atStall = (world: World, p: Vec) =>
+  adjacent(p, world.stall.pos) || adjacent(p, { x: world.stall.pos.x + 1, y: world.stall.pos.y })
 const atProject = (world: World, p: Vec) => {
   const { pos, size } = world.project
   const dx = Math.max(pos.x - p.x, 0, p.x - (pos.x + size.x - 1))
@@ -296,17 +314,15 @@ const CRAFTS: Record<CraftKind, Craft> = {
       return `You caught ${got} fish at the pond.`
     },
   },
-  keep_store: {
-    label: "Tend the village store and keep its tally",
-    detail: (world) => `Your duty. Count what goes in and out of the store and keep it tidy. The store holds ${world.store.food} food.`,
-    status: "tending the village store",
-    goal: (world) => (p) => atStore(world, p),
-    available: () => true,
-    drivers: ["purpose"],
-    finish: (world, agent) => {
-      agent.needs.respect = clamp(agent.needs.respect + 3)
-      return `You tended the store and counted ${world.store.food} food.`
-    },
+  keep_shop: {
+    label: "Mind the market stall",
+    detail: () => "Your trade. Keep the stall tidy and serve whoever comes by.",
+    status: "minding the market stall",
+    goal: (world) => (p) => atStall(world, p),
+    // The shopkeeper's work is choosing how to price: see the set_price options.
+    available: () => false,
+    drivers: ["purpose", "trade"],
+    finish: () => "You minded the stall.",
   },
   shrine: {
     label: "Tend the shrine at the old well",
@@ -358,10 +374,14 @@ function goalFor(world: World, agent: Agent, intent: Intent): (p: Vec) => boolea
     case "rest":
     case "eat_carry":
       return () => true
-    case "talk": {
+    case "approach": {
       const target = agentById(world, intent.targetId)
       return (p) => !!target && manhattan(p, target.pos) <= 1
     }
+    case "buy":
+    case "sell":
+    case "set_price":
+      return (p) => atStall(world, p)
     case "work":
       return CRAFTS[agent.persona.craft].goal(world)
     case "build":
@@ -394,8 +414,12 @@ function intentPhrase(world: World, intent: Intent, viewer?: Agent): string {
     case "rest":
     case "eat_carry":
       return "a spot to rest"
-    case "talk":
+    case "approach":
       return viewer && intent.targetId === viewer.id ? "you" : nameOf(world, intent.targetId)
+    case "buy":
+    case "sell":
+    case "set_price":
+      return "the market stall"
     case "work":
       return "work"
     case "build":
@@ -418,7 +442,7 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
       return "standing still, thinking"
     case "moving":
       switch (s.intent.kind) {
-        case "talk":
+        case "approach":
           return `walking over to ${who(s.intent.targetId)}`
         case "wander":
           return "wandering around"
@@ -463,13 +487,21 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
           return "taking food from the village store"
         case "eat_carry":
           return "eating the food they carry"
+        case "buy":
+          return "buying food at the market stall"
+        case "sell":
+          return "selling food at the market stall"
+        case "set_price":
+          return "minding the market stall"
+        case "approach":
+          return `talking with ${who(s.intent.targetId)}`
         default:
           return "busy"
       }
     case "asking":
       return `trying to start a chat with ${who(s.targetId)}`
     case "considering":
-      return `being asked to chat by ${who(s.askerId)}`
+      return `talking with ${who(s.askerId)}`
     case "chatting":
       return `chatting with ${who(s.partnerId)}`
     case "sleeping":
@@ -561,7 +593,21 @@ export function perceive(world: World, agent: Agent, askedBy?: Agent): Perceptio
       `The granary is ${pctBuilt(world)}% built (${contributorsPhrase(world)}). Until it is finished, the store loses food to spoilage whenever it holds more than ${STORE_SAFE_WITHOUT_GRANARY}.`,
     )
   }
-  if (agent.carry > 0) noticing.push(`You are carrying ${agent.carry} food.`)
+  noticing.push(`You have ${agent.coins} coin${agent.coins === 1 ? "" : "s"}${agent.carry > 0 ? ` and are carrying ${agent.carry} food` : ""}.`)
+  const { stall } = world
+  const keeper = world.agents.find((a) => a.persona.craft === "keep_shop")
+  noticing.push(
+    `The market stall${keeper ? ` run by ${keeper.id === agent.id ? "you" : keeper.persona.name}` : ""} sells food at ${stall.price} coin${stall.price === 1 ? "" : "s"} a portion and buys at ${stall.buyPrice}; it has ${stall.food} food and ${stall.coins} coins.`,
+  )
+  for (const d of world.debts) {
+    if (d.state !== "open") continue
+    const overdue = world.tick > d.dueTick
+    if (d.debtorId === agent.id) {
+      noticing.push(`You owe ${nameOf(world, d.creditorId)} ${d.owed} coins, due by ${formatClock(d.dueTick)}${overdue ? ", and it is overdue" : ""}.`)
+    } else if (d.creditorId === agent.id) {
+      noticing.push(`${nameOf(world, d.debtorId)} owes you ${d.owed} coins, due by ${formatClock(d.dueTick)}${overdue ? ", and it is overdue" : ""}.`)
+    }
+  }
 
   const stocked = world.bushes.filter((b) => b.berries > 0)
   const berriesLeft = stocked.reduce((n, b) => n + b.berries, 0)
@@ -572,7 +618,7 @@ export function perceive(world: World, agent: Agent, askedBy?: Agent): Perceptio
     noticing.push(`The berry grove has ${berriesLeft} berr${berriesLeft === 1 ? "y" : "ies"} left; the nearest bush is ${stepsPhrase(d)}.`)
   }
   noticing.push(`The pond is ${stepsPhrase(stepsTo(field, (p) => touchesWater(world, p)))}.`)
-  if (askedBy) noticing.push(`${askedBy.persona.name} just walked up to you and wants to chat.`)
+  if (askedBy) noticing.push(`${askedBy.persona.name} just walked up to you.`)
 
   return {
     name: agent.persona.name,
@@ -682,6 +728,50 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
     }
   }
 
+  const { stall } = world
+  if (stall.food > 0 && agent.coins >= stall.price && agent.carry < CARRY_CAP) {
+    add({
+      id: "buy",
+      label: "Buy food at the market stall",
+      detail: `The stall sells food at ${stall.price} coin${stall.price === 1 ? "" : "s"} a portion. You have ${agent.coins} coins; it has ${stall.food} food. You would buy up to 2.`,
+      intent: { kind: "buy" },
+      drivers: ["trade"],
+    })
+  }
+  if (agent.carry > 0 && stall.coins >= stall.buyPrice) {
+    add({
+      id: "sell",
+      label: "Sell your food to the market stall",
+      detail: `The stall pays ${stall.buyPrice} coin a portion and has ${stall.coins} coins. You carry ${agent.carry} food.`,
+      intent: { kind: "sell" },
+      drivers: ["trade"],
+    })
+  }
+  if (agent.persona.craft === "keep_shop") {
+    const now = `The price is ${stall.price} now.`
+    add({
+      id: "price_fair",
+      label: "Run the stall at a fair price (2 coins a portion)",
+      detail: `An honest margin: the stall buys at 1 and sells at 2. ${now} About an hour minding the stall.`,
+      intent: { kind: "set_price", price: 2 },
+      drivers: ["purpose", "trade"],
+    })
+    add({
+      id: "price_high",
+      label: "Raise the stall's price to 4 coins a portion",
+      detail: `Hungry villagers will pay more and you keep the difference, but people who notice may resent it. ${now} About an hour minding the stall.`,
+      intent: { kind: "set_price", price: 4 },
+      drivers: ["exploitation", "trade"],
+    })
+    add({
+      id: "price_cheap",
+      label: "Sell at cost to help hungry villagers (1 coin a portion)",
+      detail: `You make nothing on each sale, but more people can afford to eat. ${now} About an hour minding the stall.`,
+      intent: { kind: "set_price", price: 1 },
+      drivers: ["generosity", "purpose"],
+    })
+  }
+
   if (!projectDone(world)) {
     const isBuilder = agent.persona.craft === "build"
     add({
@@ -702,14 +792,111 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
     .filter((o) => o.id !== agent.id && canApproach(o))
     .sort((a, b) => manhattan(agent.pos, a.pos) - manhattan(agent.pos, b.pos))
     .slice(0, TALK_OPTIONS)
+  const approach = (other: Agent, offer: Offer): Intent => ({ kind: "approach", targetId: other.id, offer })
   for (const other of approachable) {
+    const where = `${other.persona.name} is ${manhattan(agent.pos, other.pos)} steps away, ${describeStatus(world, other, agent)}.`
     add({
       id: `talk_${other.id}`,
       label: `Go chat with ${other.persona.name}`,
-      detail: `Chatting eases loneliness and is a little fun, but they may say no. ${other.persona.name} is ${manhattan(agent.pos, other.pos)} steps away, ${describeStatus(world, other, agent)}.`,
-      intent: { kind: "talk", targetId: other.id },
+      detail: `Chatting eases loneliness and is a little fun, but they may say no. ${where}`,
+      intent: approach(other, { kind: "chat" }),
       drivers: ["belonging"],
     })
+    if (other === approachable[0]) {
+      add({
+        id: `compliment_${other.id}`,
+        label: `Go say something kind to ${other.persona.name}`,
+        detail: `Tell them sincerely what you appreciate about them. It lifts their standing and warms them to you, though kind words mean less if they are frequent. ${where}`,
+        intent: approach(other, { kind: "compliment" }),
+        drivers: ["kindness"],
+      })
+    }
+  }
+  const nearest = approachable[0]
+  if (nearest) {
+    const nm = nearest.persona.name
+    const id = nearest.id
+    if (agent.carry > 0) {
+      add({
+        id: `give_food_${id}`,
+        label: `Give 1 food to ${nm}`,
+        detail: `A gift from the ${agent.carry} food you carry. ${nm} may be grateful, or may refuse.`,
+        intent: approach(nearest, { kind: "gift_food", n: 1 }),
+        drivers: ["generosity"],
+      })
+    }
+    if (agent.coins >= 3) {
+      add({
+        id: `give_coins_${id}`,
+        label: `Give 2 coins to ${nm}`,
+        detail: `A gift from your ${agent.coins} coins.`,
+        intent: approach(nearest, { kind: "gift_coins", n: 2 }),
+        drivers: ["generosity"],
+      })
+    }
+    if (agent.needs.hunger < 35) {
+      add({
+        id: `ask_${id}`,
+        label: `Ask ${nm} for some food`,
+        detail: `You are genuinely hungry. ${nm} may share food or coins, or refuse.`,
+        intent: approach(nearest, { kind: "ask_food", honest: true }),
+        drivers: ["security"],
+      })
+    } else if (agent.needs.hunger >= 50) {
+      add({
+        id: `lie_${id}`,
+        label: `Ask ${nm} for food with a made-up hard-luck story`,
+        detail: `You are not actually hungry. You would claim you have not eaten properly in a long time to get their food or coins. If ${nm} later sees you with food, they may realise you lied.`,
+        intent: approach(nearest, { kind: "ask_food", honest: false }),
+        drivers: ["deception"],
+      })
+    }
+    if (agent.coins >= 5) {
+      add({
+        id: `lend_${id}`,
+        label: `Offer to lend ${nm} 5 coins (repaid as 6 tomorrow evening)`,
+        detail: "A friendly loan with a small fee. They may accept or decline, and they may or may not pay you back.",
+        intent: approach(nearest, { kind: "lend", amount: 5, owed: 6 }),
+        drivers: ["kindness"],
+      })
+      add({
+        id: `usury_${id}`,
+        label: `Offer ${nm} a 5 coin loan at a steep rate (repaid as 9)`,
+        detail: "You profit if they are desperate enough to accept, and more so if they cannot pay. People may see it as taking advantage.",
+        intent: approach(nearest, { kind: "lend", amount: 5, owed: 9 }),
+        drivers: ["exploitation"],
+      })
+    }
+    add({
+      id: `pickpocket_${id}`,
+      label: `Try to pick ${nm}'s pocket`,
+      detail: `Quietly steal up to ${PICKPOCKET_MAX} coins while they are distracted. If they or anyone nearby notices, they will know you are a thief.`,
+      intent: approach(nearest, { kind: "pickpocket" }),
+      drivers: ["theft"],
+    })
+  }
+  for (const d of world.debts) {
+    if (d.state !== "open") continue
+    const other = agentById(world, d.creditorId === agent.id ? d.debtorId : d.creditorId)
+    if (!other || other.inside) continue
+    if (d.debtorId === agent.id && agent.coins >= d.owed) {
+      add({
+        id: `repay_${d.id}`,
+        label: `Pay back the ${d.owed} coins you owe ${other.persona.name}`,
+        detail: `Due by ${formatClock(d.dueTick)}. You have ${agent.coins} coins.`,
+        intent: approach(other, { kind: "repay", debtId: d.id }),
+        drivers: ["duty"],
+      })
+    }
+    if (d.creditorId === agent.id && world.tick > d.dueTick) {
+      add({
+        id: `demand_${d.id}`,
+        label: `Demand that ${other.persona.name} repay the ${d.owed} coins they owe you`,
+        detail: "Confront them about the overdue debt in front of anyone nearby. It may shame them into paying, or sour things between you.",
+        intent: approach(other, { kind: "demand_repay", debtId: d.id }),
+        drivers: ["confrontation"],
+      })
+    }
   }
 
   add({
@@ -820,6 +1007,7 @@ function arrive(world: World, agent: Agent, intent: Intent) {
       }
       bush.berries -= 1
       if (bush.nextRegrow <= world.tick) bush.nextRegrow = world.tick + BERRY_REGROW_TICKS
+      exposeLies(world, agent)
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.eat }
       return
     }
@@ -881,6 +1069,7 @@ function arrive(world: World, agent: Agent, intent: Intent) {
       world.store.food -= n
       agent.needs.hunger = clamp(agent.needs.hunger + 12 * n)
       count(world, "meals_shared")
+      exposeLies(world, agent)
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.meal }
       return
     }
@@ -918,15 +1107,83 @@ function arrive(world: World, agent: Agent, intent: Intent) {
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.take_store }
       return
     }
+    case "buy": {
+      const { stall } = world
+      const n = Math.min(2, stall.food, Math.floor(agent.coins / stall.price), CARRY_CAP - agent.carry)
+      if (n <= 0) {
+        remember(world, agent, "You went to buy food but could not.")
+        becomeIdle(world, agent)
+        return
+      }
+      const cost = n * stall.price
+      agent.coins -= cost
+      stall.coins += cost
+      stall.food -= n
+      agent.carry += n
+      count(world, "purchases")
+      count(world, "coins_spent", cost)
+      remember(world, agent, `You bought ${n} food at the stall for ${cost} coins.`)
+      exposeLies(world, agent)
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.buy }
+      return
+    }
+    case "sell": {
+      const { stall } = world
+      const n = Math.min(agent.carry, Math.floor(stall.coins / stall.buyPrice))
+      if (n <= 0) {
+        becomeIdle(world, agent)
+        return
+      }
+      const paid = n * stall.buyPrice
+      agent.carry -= n
+      agent.coins += paid
+      stall.food += n
+      stall.coins -= paid
+      count(world, "sales")
+      remember(world, agent, `You sold ${n} food to the stall for ${paid} coins.`)
+      exposeLies(world, agent)
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.sell }
+      return
+    }
+    case "set_price":
+      agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS.set_price }
+      return
     case "wander":
     case "rest":
     case "eat_carry":
+      if (intent.kind === "eat_carry") exposeLies(world, agent)
       agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS[intent.kind] }
       return
-    case "talk":
-      // Talk arrival is handled by the chase logic.
+    case "approach":
+      // Approach arrival is handled by the chase logic.
       return
   }
+}
+
+/** A liar who is seen with food by someone they lied to is found out. */
+function exposeLies(world: World, liar: Agent) {
+  for (const lie of world.lies) {
+    if (lie.discovered || lie.liarId !== liar.id || world.tick - lie.tick > LIE_MEMORY_TICKS) continue
+    const victim = agentById(world, lie.victimId)
+    if (!victim || victim.inside || victim.status.kind === "sleeping" || manhattan(victim.pos, liar.pos) > WITNESS_RADIUS) continue
+    lie.discovered = true
+    count(world, "lies_caught")
+    remember(world, victim, `You saw ${liar.persona.name} with plenty of food and realised their hard-luck story was a lie.`)
+    nudgeAffinity(victim, liar.id, -0.35)
+    flash(world, victim, "angry", 6)
+    lifeEvent(world, victim, "lied_to", `found out ${liar.persona.name} lied to them`)
+    remember(world, liar, `${victim.persona.name} saw you with food and realised your story was a lie.`)
+    liar.needs.respect = clamp(liar.needs.respect - 8)
+    liar.needCause.respect = `${victim.persona.name} caught you in a lie`
+    lifeEvent(world, liar, "caught", `caught lying to ${victim.persona.name}`)
+    log(world, `${victim.persona.name} realised ${liar.persona.name} lied to get food.`, [victim.id, liar.id], "conflict")
+  }
+}
+
+/** Tomorrow at 6 pm, as a tick. */
+function tomorrowEvening(world: World): number {
+  const { day } = clockOf(world.tick)
+  return Math.round((day * 1440 + 18 * 60 - 7 * 60) / 5)
 }
 
 function completeProject(world: World) {
@@ -1012,8 +1269,28 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
     case "eat_carry":
       remember(world, agent, "You ate some of the food you were carrying.")
       break
+    case "set_price": {
+      const before = world.stall.price
+      world.stall.price = intent.price
+      count(world, `price_${intent.price}`)
+      markPurpose(world, agent, "minded the market stall")
+      const verb = intent.price > before ? "raised" : intent.price < before ? "lowered" : "kept"
+      remember(world, agent, `You minded the stall and ${verb} the price to ${intent.price} coins a portion.`)
+      if (intent.price !== before) {
+        log(
+          world,
+          `${agent.persona.name} ${verb} the market stall's price to ${intent.price} coin${intent.price === 1 ? "" : "s"} a portion.`,
+          [agent.id],
+          intent.price >= 4 ? "conflict" : intent.price <= 1 ? "good" : "info",
+        )
+      }
+      break
+    }
     case "deposit":
     case "take_store":
+    case "buy":
+    case "sell":
+    case "approach":
       break
   }
   becomeIdle(world, agent)
@@ -1027,24 +1304,141 @@ function giveUpTalk(world: World, agent: Agent, targetId: string, reason: string
   becomeIdle(world, agent)
 }
 
-function startAsking(world: World, agent: Agent, target: Agent): SimRequest {
+function startAsking(world: World, agent: Agent, target: Agent, offer: Offer): SimRequest {
   agent.facing = facingToward(agent.pos, target.pos)
   target.facing = facingToward(target.pos, agent.pos)
   agent.status = { kind: "asking", targetId: target.id, since: world.tick }
-  target.status = { kind: "considering", askerId: agent.id, resume: target.status, since: world.tick }
+  target.status = { kind: "considering", askerId: agent.id, offer, resume: target.status, since: world.tick }
   flash(world, agent, "exclaim", 4)
-  return issue(world, { kind: "respond", agentId: target.id, askerId: agent.id, perception: perceive(world, target, agent) })
+  if (offer.kind === "ask_food" && !offer.honest) count(world, "lies_told")
+  return issue(world, {
+    kind: "respond",
+    agentId: target.id,
+    askerId: agent.id,
+    offer,
+    wire: wireOffer(world, offer),
+    can: { food: target.carry, coins: target.coins },
+    perception: perceive(world, target, agent),
+  })
 }
 
-function chase(world: World, agent: Agent, status: Extract<Status, { kind: "moving" }>, targetId: string): SimRequest | null {
+/** What the approached villager is told. A plea never reveals whether it is honest. */
+function wireOffer(world: World, offer: Offer): OfferWire {
+  switch (offer.kind) {
+    case "chat":
+      return { kind: "chat" }
+    case "gift_food":
+      return { kind: "gift_food", n: offer.n }
+    case "gift_coins":
+      return { kind: "gift_coins", n: offer.n }
+    case "ask_food":
+      return { kind: "ask_food" }
+    case "lend":
+      return { kind: "lend", amount: offer.amount, owed: offer.owed }
+    case "demand_repay":
+      return { kind: "demand_repay", owed: world.debts.find((d) => d.id === offer.debtId)?.owed ?? 1 }
+    default:
+      throw new Error(`Offer ${offer.kind} does not ask for a reply`)
+  }
+}
+
+/** Acts that need no reply: they simply happen when you reach someone. */
+function actOnArrival(world: World, agent: Agent, target: Agent, offer: Offer): boolean {
+  const done = () => {
+    agent.status = { kind: "acting", intent: { kind: "approach", targetId: target.id, offer }, ticksLeft: 2 }
+  }
+  agent.facing = facingToward(agent.pos, target.pos)
+  switch (offer.kind) {
+    case "compliment": {
+      // Kind words land less when they are frequent: halve the effect for each one in the last few hours.
+      const recent = target.memory.filter((m) => world.tick - m.tick < 48 && m.text.includes("said something kind")).length
+      const weight = 1 / 2 ** recent
+      target.needs.respect = clamp(target.needs.respect + 6 * weight)
+      target.needCause.respect = `${agent.persona.name} told you what they appreciate about you`
+      nudgeAffinity(target, agent.id, 0.08 * weight)
+      nudgeAffinity(agent, target.id, 0.03)
+      flash(world, target, "thanks", 5)
+      count(world, "compliments")
+      remember(world, target, `${agent.persona.name} said something kind and sincere to you.`)
+      remember(world, agent, `You said something kind to ${target.persona.name}.`)
+      log(world, `${agent.persona.name} said something kind to ${target.persona.name}.`, [agent.id, target.id], "good")
+      done()
+      return true
+    }
+    case "pickpocket": {
+      const n = Math.min(PICKPOCKET_MAX, target.coins)
+      if (n === 0) {
+        remember(world, agent, `You tried ${target.persona.name}'s pockets but they had no coins.`)
+        done()
+        return true
+      }
+      target.coins -= n
+      agent.coins += n
+      const targetNoticed = !target.inside && ["idle", "deciding", "moving"].includes(target.status.kind)
+      const seenBy = witnessesOf(world, agent).filter((w) => w.id !== target.id)
+      if (targetNoticed || seenBy.length) {
+        count(world, "pickpockets_caught")
+        agent.needs.respect = clamp(agent.needs.respect - 15)
+        agent.needCause.respect = "you were seen stealing"
+        const who = [...(targetNoticed ? [target] : []), ...seenBy]
+        remember(world, agent, `You picked ${target.persona.name}'s pocket for ${n} coins, and ${names(world, who.map((w) => w.id))} saw.`)
+        if (targetNoticed) {
+          remember(world, target, `${agent.persona.name} picked your pocket and took ${n} coins.`)
+          nudgeAffinity(target, agent.id, -0.5)
+          flash(world, target, "angry", 6)
+          lifeEvent(world, target, "robbed", `robbed by ${agent.persona.name}`)
+        } else {
+          target.missingCoins += n
+        }
+        for (const w of seenBy) {
+          remember(world, w, `You saw ${agent.persona.name} pick ${target.persona.name}'s pocket.`)
+          nudgeAffinity(w, agent.id, -0.3)
+          flash(world, w, "eye", 6)
+        }
+        lifeEvent(world, agent, "caught", "caught picking a pocket")
+        log(world, `${names(world, who.map((w) => w.id))} saw ${agent.persona.name} pick ${target.persona.name}'s pocket.`, [agent.id, target.id], "conflict")
+      } else {
+        count(world, "pickpockets_unseen")
+        target.missingCoins += n
+        remember(world, agent, `You picked ${target.persona.name}'s pocket for ${n} coins and nobody noticed.`)
+        lifeEvent(world, agent, "got_away", "got away with picking a pocket")
+        log(world, `Unseen: ${agent.persona.name} picked ${target.persona.name}'s pocket for ${n} coins.`, [agent.id, target.id], "conflict")
+      }
+      done()
+      return true
+    }
+    case "repay": {
+      const debt = world.debts.find((d) => d.id === offer.debtId)
+      if (debt && debt.state === "open" && agent.coins >= debt.owed) {
+        agent.coins -= debt.owed
+        target.coins += debt.owed
+        debt.state = "repaid"
+        count(world, "loans_repaid")
+        nudgeAffinity(target, agent.id, 0.15)
+        lifeEvent(world, target, "helped", `${agent.persona.name} repaid a debt`)
+        remember(world, target, `${agent.persona.name} paid back the ${debt.owed} coins they owed you.`)
+        remember(world, agent, `You paid back the ${debt.owed} coins you owed ${target.persona.name}.`)
+        flash(world, target, "coin", 4)
+        log(world, `${agent.persona.name} repaid ${target.persona.name} ${debt.owed} coins.`, [agent.id, target.id], "good")
+      }
+      done()
+      return true
+    }
+    default:
+      return false
+  }
+}
+
+function chase(world: World, agent: Agent, status: Extract<Status, { kind: "moving" }>, targetId: string, offer: Offer): SimRequest | null {
   const target = agentById(world, targetId)
   if (!target || target.inside) {
     giveUpTalk(world, agent, targetId, `You went to find ${nameOf(world, targetId)} but they had gone inside.`)
     return null
   }
   if (manhattan(agent.pos, target.pos) <= 1) {
+    if (actOnArrival(world, agent, target, offer)) return null
     if (target.status.kind === "moving" || target.status.kind === "acting" || target.status.kind === "idle") {
-      return startAsking(world, agent, target)
+      return startAsking(world, agent, target, offer)
     }
     status.waited += 1
     if (status.waited > BUSY_WAIT_TICKS) {
@@ -1076,13 +1470,14 @@ function moveTo(agent: Agent, next: Vec) {
 // Tick
 
 type RequestBase = { id: number; tick: number; agentId: string; perception: Perception }
+type RespondFields = { askerId: string; offer: Offer; wire: OfferWire; can: { food: number; coins: number } }
 export type SimRequest =
   | (RequestBase & { kind: "decide"; options: OptionSpec[] })
-  | (RequestBase & { kind: "respond"; askerId: string })
+  | (RequestBase & { kind: "respond" } & RespondFields)
 
 type RequestInit =
   | { kind: "decide"; agentId: string; perception: Perception; options: OptionSpec[] }
-  | { kind: "respond"; agentId: string; askerId: string; perception: Perception }
+  | ({ kind: "respond"; agentId: string; perception: Perception } & RespondFields)
 
 /** Every JEV request gets a deterministic id so recorded answers can be matched on replay. */
 function issue(world: World, init: RequestInit): SimRequest {
@@ -1107,10 +1502,16 @@ function decayNeeds(world: World, agent: Agent) {
   if (asleep) agent.needs.energy = clamp(agent.needs.energy + SLEEP_ENERGY_GAIN + 0.2)
 
   // Health: falls while starving or parched, recovers slowly otherwise.
-  const deprived = agent.needs.hunger < 10 || agent.needs.thirst < 10
-  agent.needs.health = clamp(agent.needs.health + (deprived ? -0.35 : asleep ? 0.25 : 0.05))
-  if (deprived) agent.needCause.health = "you are going without food or water"
-  else if (agent.needs.health >= 95) delete agent.needCause.health
+  const starving = agent.needs.hunger < 10
+  const parched = agent.needs.thirst < 10
+  const deprived = starving || parched
+  agent.needs.health = clamp(agent.needs.health + (deprived ? -HEALTH_LOSS : asleep ? 0.25 : 0.05))
+  if (deprived) {
+    const hours = Math.max(1, Math.round((agent.needs.health / HEALTH_LOSS) * (5 / 60)))
+    const what = starving && parched ? "food and water" : starving ? "food" : "water"
+    agent.needCause.health = `you are going without ${what}; at this rate you will collapse in about ${hours} hour${hours === 1 ? "" : "s"}`
+  } else if (agent.needs.health >= 95) delete agent.needCause.health
+  else agent.needCause.health = "you are slowly recovering"
 }
 
 function applyActing(world: World, agent: Agent, intent: Intent) {
@@ -1164,6 +1565,9 @@ function applyActing(world: World, agent: Agent, intent: Intent) {
     case "meal":
       n.social = clamp(n.social + 2)
       break
+    case "set_price":
+      n.purpose = clamp(n.purpose + 3)
+      break
     case "eat_carry":
       if (agent.carry > 0) {
         agent.carry -= 1
@@ -1196,6 +1600,24 @@ function spoilStore(world: World) {
   count(world, "food_spoiled")
 }
 
+/** Debts left unpaid past the grace period are defaults. */
+function settleDebts(world: World) {
+  for (const d of world.debts) {
+    if (d.state !== "open" || world.tick <= d.dueTick + LOAN_GRACE_TICKS) continue
+    d.state = "defaulted"
+    count(world, "loans_defaulted")
+    const creditor = agentById(world, d.creditorId)
+    const debtor = agentById(world, d.debtorId)
+    if (creditor) {
+      remember(world, creditor, `${nameOf(world, d.debtorId)} never repaid the ${d.owed} coins they owed you.`)
+      nudgeAffinity(creditor, d.debtorId, -0.3)
+      lifeEvent(world, creditor, "defaulted_on", `${nameOf(world, d.debtorId)} defaulted on a loan`)
+    }
+    if (debtor) remember(world, debtor, `You never repaid the ${d.owed} coins you owed ${nameOf(world, d.creditorId)}.`)
+    log(world, `${nameOf(world, d.debtorId)} defaulted on ${d.owed} coins owed to ${nameOf(world, d.creditorId)}.`, [d.debtorId, d.creditorId], "conflict")
+  }
+}
+
 function collapse(world: World, agent: Agent) {
   agent.status = { kind: "collapsed", ticksLeft: COLLAPSE_TICKS }
   agent.needs.health = 5
@@ -1209,6 +1631,7 @@ export function step(world: World): SimRequest[] {
   const requests: SimRequest[] = []
   regrowBerries(world)
   spoilStore(world)
+  settleDebts(world)
 
   for (const agent of world.agents) {
     agent.prev = { ...agent.pos }
@@ -1222,6 +1645,12 @@ export function step(world: World): SimRequest[] {
     switch (s.kind) {
       case "idle":
         if (world.tick >= s.retryAt) {
+          if (agent.missingCoins > 0) {
+            remember(world, agent, `You noticed ${agent.missingCoins} coins missing from your purse.`)
+            lifeEvent(world, agent, "robbed", "found coins missing from their purse")
+            count(world, "thefts_discovered")
+            agent.missingCoins = 0
+          }
           const options = buildOptions(world, agent)
           agent.status = { kind: "deciding", since: world.tick, options }
           requests.push(issue(world, { kind: "decide", agentId: agent.id, perception: perceive(world, agent), options }))
@@ -1232,8 +1661,8 @@ export function step(world: World): SimRequest[] {
       case "considering":
         break
       case "moving": {
-        if (s.intent.kind === "talk") {
-          const req = chase(world, agent, s, s.intent.targetId)
+        if (s.intent.kind === "approach") {
+          const req = chase(world, agent, s, s.intent.targetId, s.intent.offer)
           if (req) requests.push(req)
           break
         }
@@ -1379,18 +1808,189 @@ function applyDecision(world: World, agent: Agent, ans: JevAnswer, mode: ChoiceM
   })
   count(world, `picked_${picked.intent.kind}`)
   tallyDrivers(world, agent, picked.drivers)
+  habit(world, agent, picked.drivers, picked.label)
 
-  if (picked.intent.kind === "talk") {
+  if (picked.intent.kind === "approach" && picked.intent.offer.kind === "chat") {
     const target = agentById(world, picked.intent.targetId)
     log(world, `${agent.persona.name} decided to go chat with ${target?.persona.name ?? "someone"}.`, [agent.id, picked.intent.targetId], "social")
   }
   startIntent(world, agent, picked.intent)
 }
 
-function applyResponse(world: World, target: Agent, ans: JevAnswer, mode: ChoiceMode) {
+function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { kind: "respond" }>, ans: JevAnswer, mode: ChoiceMode) {
   if (target.status.kind !== "considering") return
-  const { askerId, resume } = target.status
+  const { askerId, resume, offer } = target.status
   const asker = agentById(world, askerId)
+  if (offer.kind === "chat") return applyChatReply(world, target, asker, resume, ans, mode)
+
+  const reply = ans.answers.reply
+  const criteria = replyCriteria(req.wire, req.can, asker?.persona.name ?? "them")
+  if (!reply || reply.type !== "choice") {
+    target.status = resume
+    if (asker?.status.kind === "asking") becomeIdle(world, asker, ERROR_BACKOFF_TICKS)
+    world.stats.errors += 1
+    return
+  }
+  world.stats.responses += 1
+  track(world, ans)
+  target.mood = readMood(ans.answers.mood)
+  const known = Object.fromEntries(Object.keys(criteria).map((id) => [id, reply.probabilities[id] ?? 0]))
+  const choice = pickFrom(world, known, criteria[reply.choice] ? reply.choice : Object.keys(criteria)[0], mode)
+  record(world, target, {
+    tick: world.tick,
+    kind: "respond",
+    state: ans.state,
+    options: Object.entries(criteria)
+      .map(([id, label]) => ({ id, label, p: known[id] ?? 0 }))
+      .sort((a, b) => b.p - a.p),
+    picked: choice,
+    pickedLabel: criteria[choice] ?? choice,
+    mode,
+    latencyMs: ans.latencyMs,
+    motive: null,
+    confidence: ans.confidence.reply ?? null,
+    drivers: [],
+  })
+  target.status = resume
+  if (!asker || asker.status.kind !== "asking") return
+  becomeIdle(world, asker)
+  const A = asker.persona.name
+  const T = target.persona.name
+
+  switch (offer.kind) {
+    case "gift_food":
+    case "gift_coins": {
+      const what = offer.kind === "gift_food" ? `${offer.n} food` : `${offer.n} coins`
+      if (choice === "refuse") {
+        count(world, "gifts_refused")
+        remember(world, asker, `${T} refused your gift of ${what}.`)
+        remember(world, target, `You refused ${A}'s gift of ${what}.`)
+        nudgeAffinity(asker, target.id, -0.05)
+        break
+      }
+      const has = offer.kind === "gift_food" ? asker.carry >= offer.n : asker.coins >= offer.n
+      if (!has) break
+      if (offer.kind === "gift_food") {
+        asker.carry -= offer.n
+        target.carry = Math.min(CARRY_CAP + 2, target.carry + offer.n)
+      } else {
+        asker.coins -= offer.n
+        target.coins += offer.n
+      }
+      count(world, "gifts")
+      lifeEvent(world, target, "helped", `received a gift from ${A}`)
+      if (choice === "thank") {
+        nudgeAffinity(target, asker.id, 0.15)
+        asker.needs.respect = clamp(asker.needs.respect + 4)
+        lifeEvent(world, asker, "thanked", `${T} thanked them for a gift`)
+        flash(world, target, "thanks", 5)
+        remember(world, asker, `You gave ${T} ${what} and they thanked you warmly.`)
+      } else {
+        nudgeAffinity(target, asker.id, 0.08)
+        remember(world, asker, `You gave ${T} ${what}.`)
+      }
+      flash(world, asker, "gift", 4)
+      remember(world, target, `${A} gave you ${what}.`)
+      log(world, `${A} gave ${T} ${what}.`, [asker.id, target.id], "good")
+      break
+    }
+    case "ask_food": {
+      if (choice === "refuse") {
+        count(world, "asks_refused")
+        remember(world, asker, `${T} refused to give you food.`)
+        remember(world, target, `You refused ${A}'s plea for food.`)
+        if (offer.honest) lifeEvent(world, asker, "refused", `${T} refused to help`)
+        break
+      }
+      const gaveFood = choice === "give_food" && target.carry > 0
+      const gaveCoins = choice === "give_coins" && target.coins >= 2
+      if (!gaveFood && !gaveCoins) break
+      if (gaveFood) {
+        target.carry -= 1
+        asker.carry += 1
+      } else {
+        target.coins -= 2
+        asker.coins += 2
+      }
+      const what = gaveFood ? "1 food" : "2 coins"
+      count(world, "asks_helped")
+      tallyDrivers(world, target, ["generosity"])
+      habit(world, target, ["generosity"], `gave ${what} to ${A}`)
+      remember(world, target, `${A} begged you for food and you gave them ${what}.`)
+      if (offer.honest) {
+        lifeEvent(world, asker, "helped", `${T} helped when they were hungry`)
+        nudgeAffinity(asker, target.id, 0.15)
+        remember(world, asker, `${T} gave you ${what} when you were hungry.`)
+        log(world, `${T} gave ${A} ${what} when they were hungry.`, [asker.id, target.id], "good")
+      } else {
+        world.lies.push({ id: `lie_${world.lies.length + 1}`, liarId: asker.id, victimId: target.id, tick: world.tick, discovered: false })
+        count(world, "lies_succeeded")
+        lifeEvent(world, asker, "got_away", `fooled ${T} with a sob story`)
+        remember(world, asker, `Your hard-luck story worked: ${T} gave you ${what}.`)
+        log(world, `Unseen: ${A} lied to ${T} with a sob story and got ${what}.`, [asker.id, target.id], "conflict")
+      }
+      break
+    }
+    case "lend": {
+      if (choice !== "accept" || asker.coins < offer.amount) {
+        remember(world, asker, `${T} declined your offer of a loan.`)
+        break
+      }
+      asker.coins -= offer.amount
+      target.coins += offer.amount
+      const debt = {
+        id: `debt_${world.debts.length + 1}`,
+        creditorId: asker.id,
+        debtorId: target.id,
+        lent: offer.amount,
+        owed: offer.owed,
+        dueTick: tomorrowEvening(world),
+        state: "open" as const,
+      }
+      world.debts.push(debt)
+      count(world, "loans")
+      if (offer.owed >= offer.amount * 1.5) count(world, "loans_usurious")
+      remember(world, asker, `You lent ${T} ${offer.amount} coins; they owe you ${offer.owed} by ${formatClock(debt.dueTick)}.`)
+      remember(world, target, `You borrowed ${offer.amount} coins from ${A} and owe ${offer.owed} by ${formatClock(debt.dueTick)}.`)
+      flash(world, target, "coin", 4)
+      log(world, `${A} lent ${T} ${offer.amount} coins, to be repaid as ${offer.owed}.`, [asker.id, target.id], offer.owed >= 8 ? "conflict" : "info")
+      break
+    }
+    case "demand_repay": {
+      const debt = world.debts.find((d) => d.id === offer.debtId)
+      if (!debt || debt.state !== "open") break
+      if (choice === "repay" && target.coins >= debt.owed) {
+        target.coins -= debt.owed
+        asker.coins += debt.owed
+        debt.state = "repaid"
+        count(world, "loans_repaid")
+        tallyDrivers(world, target, ["duty"])
+        remember(world, asker, `${T} paid back the ${debt.owed} coins when you demanded it.`)
+        remember(world, target, `${A} demanded the ${debt.owed} coins you owed and you paid.`)
+        log(world, `${T} paid ${A} back ${debt.owed} coins after being confronted.`, [asker.id, target.id], "info")
+      } else if (choice === "promise") {
+        debt.dueTick = world.tick + LOAN_GRACE_TICKS
+        remember(world, asker, `${T} promised to pay back the ${debt.owed} coins soon.`)
+        remember(world, target, `You promised ${A} you would pay back the ${debt.owed} coins soon.`)
+      } else {
+        count(world, "demands_refused")
+        nudgeAffinity(asker, target.id, -0.3)
+        target.needs.respect = clamp(target.needs.respect - 8)
+        target.needCause.respect = `${A} publicly called out your unpaid debt`
+        lifeEvent(world, target, "shamed", `publicly called out by ${A}`)
+        for (const w of witnessesOf(world, target)) if (w.id !== asker.id) remember(world, w, `You saw ${A} confront ${T} about an unpaid debt.`)
+        remember(world, asker, `${T} refused to pay back what they owe you.`)
+        remember(world, target, `You refused to pay ${A} back.`)
+        log(world, `${T} refused to repay ${A} when confronted.`, [asker.id, target.id], "conflict")
+      }
+      break
+    }
+    default:
+      break
+  }
+}
+
+function applyChatReply(world: World, target: Agent, asker: Agent | undefined, resume: Status, ans: JevAnswer, mode: ChoiceMode) {
   const engageAnswer = ans.answers.engage
   if (!engageAnswer || engageAnswer.type !== "boolean") {
     target.status = resume
@@ -1454,7 +2054,7 @@ export function applyAnswer(world: World, req: SimRequest, ans: JevAnswer, mode:
     case "decide":
       return applyDecision(world, agent, ans, mode)
     case "respond":
-      return applyResponse(world, agent, ans, mode)
+      return applyResponse(world, agent, req, ans, mode)
   }
 }
 
@@ -1483,7 +2083,10 @@ export function toWire(world: World, req: SimRequest): JevRequest {
       },
     }
   }
-  return { kind: "respond", payload: { perception: req.perception, askerName: nameOf(world, req.askerId) } }
+  return {
+    kind: "respond",
+    payload: { perception: req.perception, askerName: nameOf(world, req.askerId), offer: req.wire, can: req.can },
+  }
 }
 
 // ---------------------------------------------------------------------------

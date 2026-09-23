@@ -20,7 +20,7 @@ export function buildJevCall(req: JevRequest): JevCall {
     case "respond":
       return {
         state: buildState(req.payload.perception),
-        questions: respondQuestions(req.payload.perception, req.payload.askerName),
+        questions: respondQuestions(req.payload.perception, req.payload.askerName, req.payload.offer, req.payload.can),
       }
     case "assess":
       return { state: buildAssessState(req.payload), questions: assessQuestions() }

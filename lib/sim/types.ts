@@ -22,6 +22,7 @@ export type Tile =
   | "rock"
   | "site"
   | "store"
+  | "stall"
 
 export type House = { id: string; residents: string[]; x: number; y: number; door: Vec }
 export type Bush = { id: string; pos: Vec; berries: number; nextRegrow: number }
@@ -45,7 +46,7 @@ export type Project = {
 export type Store = { pos: Vec; food: number; nextSpoil: number }
 
 /** What a villager's day job actually does in the world. */
-export type CraftKind = "build" | "cook" | "farm" | "forage" | "fish" | "keep_store" | "shrine" | "stories"
+export type CraftKind = "build" | "cook" | "farm" | "forage" | "fish" | "keep_shop" | "shrine" | "stories"
 
 export type Persona = {
   id: string
@@ -58,6 +59,7 @@ export type Persona = {
   /** Multipliers on the base per-tick drain of bodily needs. */
   decay: Partial<Record<NeedKey, number>>
   start: Needs
+  coins: number
 }
 
 /**
@@ -77,15 +79,51 @@ export type DriverKey =
   | "security"
   | "greed"
   | "rest"
+  | "trade"
+  | "kindness"
+  | "deception"
+  | "exploitation"
+  | "theft"
+  | "duty"
+  | "confrontation"
 
-export const PROSOCIAL_DRIVERS: DriverKey[] = ["building", "providing", "generosity"]
-export const ANTISOCIAL_DRIVERS: DriverKey[] = ["greed"]
+export const PROSOCIAL_DRIVERS: DriverKey[] = ["building", "providing", "generosity", "kindness", "duty"]
+export const ANTISOCIAL_DRIVERS: DriverKey[] = ["greed", "theft", "deception", "exploitation"]
+
+/** What one villager brings to another when they walk up to them. */
+export type Offer =
+  | { kind: "chat" }
+  | { kind: "compliment" }
+  | { kind: "gift_food"; n: number }
+  | { kind: "gift_coins"; n: number }
+  /** `honest` is known only to the asker; the target hears the same plea either way. */
+  | { kind: "ask_food"; honest: boolean }
+  | { kind: "lend"; amount: number; owed: number }
+  | { kind: "pickpocket" }
+  | { kind: "repay"; debtId: string }
+  | { kind: "demand_repay"; debtId: string }
+
+export type Debt = {
+  id: string
+  creditorId: string
+  debtorId: string
+  lent: number
+  owed: number
+  dueTick: number
+  state: "open" | "repaid" | "defaulted"
+}
+
+/** A lie told for gain. Discovered if the victim later sees the liar with food. */
+export type Lie = { id: string; liarId: string; victimId: string; tick: number; discovered: boolean }
+
+/** The market stall: the shopkeeper sets the price; anyone can buy or sell. */
+export type Stall = { pos: Vec; food: number; coins: number; price: number; buyPrice: number }
 
 export type Intent =
   | { kind: "eat"; bushId: string }
   | { kind: "drink" }
   | { kind: "sleep" }
-  | { kind: "talk"; targetId: string }
+  | { kind: "approach"; targetId: string; offer: Offer }
   | { kind: "explore"; poiId: string }
   | { kind: "campfire" }
   | { kind: "wander"; target: Vec }
@@ -97,6 +135,9 @@ export type Intent =
   | { kind: "meal" }
   | { kind: "take_store" }
   | { kind: "eat_carry" }
+  | { kind: "buy" }
+  | { kind: "sell" }
+  | { kind: "set_price"; price: number }
 
 export type OptionSpec = { id: string; label: string; detail: string; intent: Intent; drivers: DriverKey[] }
 
@@ -107,7 +148,7 @@ export type Status =
   | { kind: "moving"; intent: Intent; path: Vec[]; startedAt: number; waited: number }
   | { kind: "acting"; intent: Intent; ticksLeft: number }
   | { kind: "asking"; targetId: string; since: number }
-  | { kind: "considering"; askerId: string; resume: Status; since: number }
+  | { kind: "considering"; askerId: string; offer: Offer; resume: Status; since: number }
   | { kind: "chatting"; partnerId: string; ticksLeft: number }
   | { kind: "sleeping" }
   | { kind: "collapsed"; ticksLeft: number }
@@ -131,7 +172,9 @@ export type DecisionRecord = {
 
 export type MemoryEntry = { tick: number; text: string }
 
-export type Flash = { kind: "heart" | "angry" | "exclaim" | "sweat" | "eye" | "thanks"; until: number }
+export type Flash = { kind: "heart" | "angry" | "exclaim" | "sweat" | "eye" | "thanks" | "coin" | "gift"; until: number }
+
+export type DriftEntry = { tick: number; key: string; delta: number; cause: string }
 
 export type Agent = {
   id: string
@@ -147,6 +190,12 @@ export type Agent = {
   needCause: Partial<Record<NeedKey, string>>
   /** Food portions carried (berries or fish). */
   carry: number
+  coins: number
+  /** How this villager's psyche has changed, and why. */
+  drift: DriftEntry[]
+  driftToday: { day: number; used: Record<string, number> }
+  /** Coins stolen without them noticing yet; discovered at their next decision. */
+  missingCoins: number
   status: Status
   memory: MemoryEntry[]
   affinity: Record<string, number>
@@ -200,6 +249,9 @@ export type World = {
   campfire: Vec
   project: Project
   store: Store
+  stall: Stall
+  debts: Debt[]
+  lies: Lie[]
   agents: Agent[]
   log: LogEntry[]
   stats: Stats

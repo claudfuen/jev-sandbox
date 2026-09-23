@@ -23,6 +23,7 @@ import {
   drawRock,
   drawSand,
   drawSign,
+  drawStall,
   drawStoreBasket,
   drawTallGrass,
   drawTree,
@@ -80,6 +81,7 @@ function paintStatic(world: World): HTMLCanvasElement {
           break
         case "campfire":
         case "store":
+        case "stall":
           drawPath(ctx, px, py, tx, ty)
           break
         case "site":
@@ -247,6 +249,7 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
       if (project.doneAt !== null) drawGranary(ctx, project.pos.x * TILE, project.pos.y * TILE)
       else drawGranarySite(ctx, project.pos.x * TILE, project.pos.y * TILE, project.sessionsDone / project.sessionsNeeded)
       drawStoreBasket(ctx, store.pos.x * TILE, store.pos.y * TILE, store.food)
+      drawStall(ctx, world.stall.pos.x * TILE, world.stall.pos.y * TILE, world.stall.food, world.stall.price)
 
       const night = darkness(world.tick)
       for (const house of world.houses) {

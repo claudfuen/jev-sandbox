@@ -24,6 +24,33 @@ function affinities(world: World): number[] {
   return world.agents.flatMap((a) => world.agents.filter((b) => b.id !== a.id).map((b) => a.affinity[b.id] ?? 0))
 }
 
+function gini(xs: number[]): number {
+  const n = xs.length
+  const mu = mean(xs)
+  if (!n || mu <= 0) return 0
+  let sum = 0
+  for (const a of xs) for (const b of xs) sum += Math.abs(a - b)
+  return sum / (2 * n * n * mu)
+}
+
+function prosociality(a: World["agents"][number]): number {
+  const total = Object.values(a.drivers).reduce((n, v) => n + (v ?? 0), 0)
+  if (!total) return 0
+  const pro = PROSOCIAL_DRIVERS.reduce((n, d) => n + (a.drivers[d] ?? 0), 0)
+  const anti = ANTISOCIAL_DRIVERS.reduce((n, d) => n + (a.drivers[d] ?? 0), 0)
+  return (pro - anti) / total
+}
+
+/** Does cooperation pay? Top-half cooperators minus bottom half, on a given outcome. */
+function cooperatorsEdge(w: World, outcome: (a: World["agents"][number]) => number): number {
+  const ranked = [...w.agents].sort((a, b) => prosociality(b) - prosociality(a))
+  const half = Math.floor(ranked.length / 2)
+  if (!half) return 0
+  return mean(ranked.slice(0, half).map(outcome)) - mean(ranked.slice(-half).map(outcome))
+}
+
+const wellbeingOf = (a: World["agents"][number]) => mean(NEED_KEYS.map((k) => a.needs[k]))
+
 export const METRICS: MetricDef[] = [
   { id: "population", label: "Population", kind: "level", compute: (w) => w.agents.length },
   {
@@ -101,6 +128,36 @@ export const METRICS: MetricDef[] = [
       return total ? anti / total : 0
     },
   },
+  { id: "gini_coins", label: "Wealth inequality (Gini of coins)", kind: "level", compute: (w) => gini(w.agents.map((a) => a.coins)) },
+  { id: "stall_price", label: "Stall price", kind: "level", compute: (w) => w.stall.price },
+  { id: "gifts", label: "Gifts given", kind: "count", compute: (w) => (w.counters.gifts ?? 0) + (w.counters.asks_helped ?? 0) },
+  { id: "compliments", label: "Kind words", kind: "count", compute: (w) => w.counters.compliments ?? 0 },
+  { id: "lies_told", label: "Lies told", kind: "count", compute: (w) => w.counters.lies_told ?? 0 },
+  { id: "lies_caught", label: "Lies caught", kind: "count", compute: (w) => w.counters.lies_caught ?? 0 },
+  { id: "loans", label: "Loans", kind: "count", compute: (w) => w.counters.loans ?? 0 },
+  { id: "loans_usurious", label: "Loans at a steep rate", kind: "count", compute: (w) => w.counters.loans_usurious ?? 0 },
+  { id: "loans_defaulted", label: "Loan defaults", kind: "count", compute: (w) => w.counters.loans_defaulted ?? 0 },
+  {
+    id: "pickpockets",
+    label: "Pockets picked",
+    kind: "count",
+    compute: (w) => (w.counters.pickpockets_caught ?? 0) + (w.counters.pickpockets_unseen ?? 0),
+  },
+  { id: "trust", label: "Trust (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.psyche.trust)) },
+  { id: "benevolence", label: "Benevolence (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.psyche.values.benevolence)) },
+  {
+    id: "machiavellianism",
+    label: "Machiavellianism (mean)",
+    kind: "level",
+    compute: (w) => mean(w.agents.map((a) => a.psyche.dark.machiavellianism)),
+  },
+  {
+    id: "coop_wellbeing_edge",
+    label: "Cooperators' wellbeing edge",
+    kind: "level",
+    compute: (w) => cooperatorsEdge(w, wellbeingOf),
+  },
+  { id: "coop_wealth_edge", label: "Cooperators' wealth edge (coins)", kind: "level", compute: (w) => cooperatorsEdge(w, (a) => a.coins) },
   { id: "berries", label: "Berries on bushes", kind: "level", compute: (w) => w.bushes.reduce((n, b) => n + b.berries, 0) },
   { id: "calls", label: "JEV calls", kind: "count", compute: (w) => w.stats.calls },
   { id: "cost_usd", label: "Cost (USD, list)", kind: "count", compute: (w) => w.stats.costUsd },

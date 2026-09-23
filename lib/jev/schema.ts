@@ -69,9 +69,23 @@ export const decidePayloadSchema = z.object({
   options: z.array(optionSchema).min(2).max(64),
 })
 
+/** What the approached villager is told. It never reveals whether a plea is honest. */
+export const offerWireSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("chat") }),
+  z.object({ kind: z.literal("gift_food"), n: z.number().int().min(1).max(10) }),
+  z.object({ kind: z.literal("gift_coins"), n: z.number().int().min(1).max(50) }),
+  z.object({ kind: z.literal("ask_food") }),
+  z.object({ kind: z.literal("lend"), amount: z.number().int().min(1).max(50), owed: z.number().int().min(1).max(100) }),
+  z.object({ kind: z.literal("demand_repay"), owed: z.number().int().min(1).max(100) }),
+])
+export type OfferWire = z.infer<typeof offerWireSchema>
+
 export const respondPayloadSchema = z.object({
   perception: perceptionSchema,
   askerName: z.string().min(1).max(40),
+  offer: offerWireSchema,
+  /** What the approached villager has on them, which bounds their honest replies. */
+  can: z.object({ food: z.number().int().min(0).max(20), coins: z.number().int().min(0).max(500) }),
 })
 
 export const ASSESS_ROADMAP = {

@@ -1,5 +1,5 @@
 import { HOUSEHOLDS } from "./personas"
-import type { Bush, House, Landmark, Poi, Project, Store, Tile, Vec } from "./types"
+import type { Bush, House, Landmark, Poi, Project, Stall, Store, Tile, Vec } from "./types"
 
 export const MAP_W = 32
 export const MAP_H = 20
@@ -30,6 +30,7 @@ type MapData = {
   campfire: Vec
   project: Project
   store: Store
+  stall: Stall
 }
 
 /** House footprints, in the same order as HOUSEHOLDS. */
@@ -115,6 +116,9 @@ export function buildMap(): MapData {
   // The village store: a communal basket in the plaza.
   const store: Store = { pos: { x: 17, y: 10 }, food: STORE_START_FOOD, nextSpoil: 0 }
 
+  // The market stall: a 2x1 counter on the west side of the plaza.
+  const stall: Stall = { pos: { x: 13, y: 10 }, food: 6, coins: 10, price: 2, buyPrice: 1 }
+
   // Berry grove west of the plaza.
   const bushPositions: Vec[] = [
     { x: 4, y: 11 },
@@ -130,6 +134,8 @@ export function buildMap(): MapData {
   const campfire = { x: 15, y: 10 }
   set(campfire.x, campfire.y, "campfire")
   set(store.pos.x, store.pos.y, "store")
+  set(stall.pos.x, stall.pos.y, "stall")
+  set(stall.pos.x + 1, stall.pos.y, "stall")
   set(15, 17, "well")
   set(28, 8, "sign")
 
@@ -149,6 +155,7 @@ export function buildMap(): MapData {
     })),
     { name: "the granary build site", center: { x: 19, y: 8 }, radius: 2 },
     { name: "the flower meadow", center: { x: 15, y: 2 }, radius: 3 },
+    { name: "the market stall", center: { x: 13, y: 11 }, radius: 1 },
     { name: "the campfire in the plaza", center: campfire, radius: 3 },
     { name: "the berry grove", center: { x: 5, y: 13 }, radius: 4 },
     { name: "the pond shore", center: { x: 25, y: 14 }, radius: 5 },
@@ -158,5 +165,5 @@ export function buildMap(): MapData {
     { name: "the main street", center: { x: 15, y: 5 }, radius: 14 },
   ]
 
-  return { tiles, houses, bushes, pois, landmarks, campfire, project, store }
+  return { tiles, houses, bushes, pois, landmarks, campfire, project, store, stall }
 }

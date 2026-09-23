@@ -6,6 +6,7 @@ import { findPath } from "@/lib/sim/geometry"
 import { isWalkable, MAP_H, MAP_W } from "@/lib/sim/map"
 import { ReplayCursor, Session } from "@/lib/sim/session"
 import { jevRequestSchema, type JevAnswer } from "@/lib/jev/schema"
+import { replyCriteria } from "@/lib/jev/prompt"
 import { toWire } from "@/lib/sim/engine"
 
 describe("pixel maps", () => {
@@ -69,7 +70,13 @@ function fakeAnswer(req: SimRequest): JevAnswer {
     const motive = { type: "choice" as const, choice: "purpose", probabilities: { purpose: 0.6, gain: 0.4 } }
     return { kind: "decide", state: "", answers: { action: { type: "choice", choice, probabilities }, mood, motive }, confidence: { action: 0.5 }, latencyMs: 300, costUsd: 0.00002 }
   }
-  return { kind: "respond", state: "", answers: { engage: { type: "boolean", probability: h(3) }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
+  if (req.wire.kind === "chat") {
+    return { kind: "respond", state: "", answers: { engage: { type: "boolean", probability: h(3) }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
+  }
+  const ids = Object.keys(replyCriteria(req.wire, req.can, "them"))
+  const choice = ids[Math.floor(h(4) * ids.length)]
+  const probabilities = Object.fromEntries(ids.map((id) => [id, id === choice ? 0.7 : 0.3 / Math.max(1, ids.length - 1)]))
+  return { kind: "respond", state: "", answers: { reply: { type: "choice", choice, probabilities }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
 }
 
 describe("record and replay", () => {
@@ -146,5 +153,39 @@ describe("wire contract", () => {
       }
     }
     expect(failures.slice(0, 3)).toEqual([])
+  })
+})
+
+describe("economy and moral actions", () => {
+  test("a long stub run exercises gifts, pleas, loans, trade and pickpocketing without breaking replay", () => {
+    const session = new Session({ seed: 11 })
+    for (let t = 0; t < 900; t++) {
+      for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+    }
+    const c = session.world.counters
+    const touched = ["purchases", "gifts", "compliments", "loans", "pickpockets_caught", "pickpockets_unseen", "lies_told"].filter((k) => (c[k] ?? 0) > 0)
+    expect(touched.length).toBeGreaterThanOrEqual(4)
+    const record = session.toRecord({ id: "econ-run", title: "t", createdAt: "2026-01-01T00:00:00Z", source: "lab" })
+    const cursor = new ReplayCursor(record)
+    cursor.seek(record.meta.endTick)
+    expect(cursor.desyncs).toBe(0)
+    const strip = (w: unknown) => JSON.stringify(w, (k, v) => (k === "state" ? undefined : v))
+    expect(strip(cursor.world)).toBe(strip(session.world))
+  })
+
+  test("coins are conserved across trade, gifts, loans and theft", () => {
+    const session = new Session({ seed: 12 })
+    const total = (w: typeof session.world) => w.agents.reduce((n, a) => n + a.coins, 0) + w.stall.coins
+    const before = total(session.world)
+    for (let t = 0; t < 600; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+    expect(total(session.world)).toBe(before)
+  })
+
+  test("personality drifts with habits, within the daily cap", () => {
+    const session = new Session({ seed: 13 })
+    for (let t = 0; t < 600; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+    const drifted = session.world.agents.filter((a) => a.drift.length > 0)
+    expect(drifted.length).toBeGreaterThan(3)
+    for (const a of session.world.agents) for (const used of Object.values(a.driftToday.used)) expect(Math.abs(used)).toBeLessThanOrEqual(3.0001)
   })
 })

@@ -24,14 +24,17 @@ const perHour = (v: number) => `${v.toFixed(1)}/h`
 /** The default dashboard, shared by the live view and replays. */
 export const DEFAULT_STRIPS: StripSpec[] = [
   { id: "wellbeing", label: "Wellbeing", format: whole },
+  { id: "health", label: "Health", format: whole },
   { id: "purpose", label: "Purpose", format: whole },
-  { id: "respect", label: "Respect", format: whole },
+  { id: "prosocial_share", label: "Prosocial choices", format: pct },
+  { id: "antisocial_share", label: "Antisocial choices", format: pct },
+  { id: "gini_coins", label: "Wealth inequality", format: (v) => v.toFixed(2) },
+  { id: "trust", label: "Trust", format: whole },
+  { id: "machiavellianism", label: "Machiavellianism", format: (v) => v.toFixed(1) },
+  { id: "coop_wellbeing_edge", label: "Does cooperation pay?", format: (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}` },
+  { id: "stall_price", label: "Stall price", format: whole },
   { id: "store_food", label: "Food in the store", format: whole },
   { id: "granary", label: "Granary built", format: pct },
-  { id: "prosocial_share", label: "Prosocial choices", format: pct },
-  { id: "thefts", label: "Takings outside mealtime", format: whole },
-  { id: "friendship_density", label: "Friendship density", format: pct },
-  { id: "chats", label: "Chats per hour", mode: "rate", format: perHour },
 ]
 
 /** Turn samples into the plotted series: raw levels, or per-hour deltas of a count. */

@@ -29,6 +29,22 @@ It is an experiment in authentic decision-making, not a game.
 - Sampling uses min-p (options below 25% of JEV's favourite are never picked), or argmax
   with "Top pick".
 
+## Society systems (increments shipped so far)
+
+- `lib/sim/psyche.ts`: per-villager psychology rendered into words (`psycheLines`, versioned).
+  Psychology shapes need drain rates and how consequences feel, never option ranking.
+- `lib/sim/drift.ts`: personality drift from habit (what you keep choosing) and experience (being
+  helped, lied to, robbed, caught, getting away with it). Capped at 3 points per trait per day and
+  logged with causes in `agent.drift`.
+- Economy: coins, the market stall (the shopkeeper chooses fair, gouging or at-cost prices), buy and
+  sell, gifts, honest pleas and sob-story lies (exposed if the victim later sees the liar with
+  food), loans at fair or steep rates with repayment, demands and defaults, pickpocketing (noticed or
+  not). Coins are conserved (tested).
+- Offers: approaching someone carries a typed `Offer`; the target's reply is their own JEV choice.
+- `lib/sim/digest.ts` + lab `--assess`: JEV's advisory estimate of how interesting a run is to the owner.
+- Bodily danger is stated honestly in perception (hours until collapse, a body alarm line), because
+  personality words otherwise drown out thirst and hunger.
+
 ## Rules
 
 - shadcn preset `b1PzeK`, Base UI backed: no `asChild`, compose with the `render` prop,

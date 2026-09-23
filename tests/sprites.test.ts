@@ -3,8 +3,10 @@ import { describe, expect, test } from "bun:test"
 import {
   drawBubble,
   drawCarry,
+  drawCoins,
   drawGranary,
   drawGranarySite,
+  drawStall,
   drawStoreBasket,
   PAL,
   PIXEL_MAPS,
@@ -69,9 +71,15 @@ describe("pixel maps", () => {
   }
 
   test("new sprite maps and emote icons are registered", () => {
-    for (const name of ["BASKET", "STAKE", "GRANARY_EMBLEM", ...NEW_EMOTES.map((k) => `ICON_${k}`)]) {
+    for (const name of ["BASKET", "STAKE", "GRANARY_EMBLEM", "STALL", "COIN", ...NEW_EMOTES.map((k) => `ICON_${k}`)]) {
       expect(PIXEL_MAPS[name]).toBeDefined()
     }
+  })
+
+  test("the stall map is 32 wide and 20 rows at most (16 px tile plus the 4 px awning)", () => {
+    expect(PIXEL_MAPS.STALL.width).toBe(32)
+    expect(PIXEL_MAPS.STALL.map.length).toBeLessThanOrEqual(20)
+    expect(PIXEL_MAPS.COIN.width).toBe(5)
   })
 
   test("emote icons are 7 wide and 6 tall", () => {
@@ -203,4 +211,101 @@ describe("emote bubbles", () => {
       expectPixelArt(rects, 40, 20, 11, 11)
     })
   }
+})
+
+describe("market stall", () => {
+  const AWNING = new Set<string>([
+    PAL.outline,
+    PAL.awning,
+    PAL.awningLight,
+    PAL.awningDark,
+    PAL.cream,
+    PAL.creamLight,
+    PAL.creamDark,
+  ])
+
+  const draw = (food: number, price: number, px = 0, py = 0) => {
+    const { ctx, rects } = fakeCtx()
+    drawStall(ctx, px, py, food, price)
+    return rects
+  }
+
+  test("stays in its 32x16 footprint, with only the awning overhanging up to 4 px above", () => {
+    for (const food of [0, 1, 4, 8, 30, -2, Number.NaN]) {
+      for (const price of [0, 1, 2, 3, 4, 9, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const { ctx, rects } = fakeCtx()
+        expect(() => drawStall(ctx, 48, 64, food, price)).not.toThrow()
+        expect(rects.length).toBeGreaterThan(0)
+        expectPixelArt(rects, 48, 60, 32, 20)
+        for (const r of rects.filter((r) => r.y < 64)) {
+          expect(AWNING.has(r.style)).toBe(true)
+          expect(r.y + r.h).toBeLessThanOrEqual(64)
+        }
+      }
+    }
+  })
+
+  test("uses its own awning colours, not the red house roof or the granary thatch", () => {
+    const rects = draw(8, 4)
+    expect(countStyle(rects, PAL.awning)).toBeGreaterThan(0)
+    expect(countStyle(rects, PAL.cream)).toBeGreaterThan(0)
+    for (const other of [PAL.roof, PAL.roofDark, PAL.roofLight, PAL.thatch, PAL.thatchShade, PAL.thatchDark]) {
+      expect(countStyle(rects, other)).toBe(0)
+    }
+  })
+
+  test("shows one food item per unit of food, capped at 8, none at 0", () => {
+    const shown = (food: number) => countStyle(draw(food, 1), PAL.berry)
+    expect(shown(0)).toBe(0)
+    for (const n of [1, 3, 5, 8]) expect(shown(n)).toBe(n)
+    expect(shown(20)).toBe(8)
+    expect(shown(-4)).toBe(0)
+    expect(shown(Number.NaN)).toBe(0)
+  })
+
+  test("the price marker differs between price 1, 2 and 4", () => {
+    const signature = (price: number) => draw(3, price).map((r) => `${r.x},${r.y},${r.w},${r.h},${r.style}`).join("|")
+    const marks = [1, 2, 4].map(signature)
+    expect(new Set(marks).size).toBe(3)
+    // Food does not change with price, so the difference is the marker alone.
+    expect(countStyle(draw(3, 1), PAL.berry)).toBe(countStyle(draw(3, 4), PAL.berry))
+  })
+
+  test("fair prices show that many gold coins; gouging shows a hot pile and no gold", () => {
+    const coins = (price: number) => {
+      const rects = draw(0, price)
+      return { gold: countStyle(rects, PAL.coinShine), hot: countStyle(rects, PAL.coinHot) }
+    }
+    expect(coins(0)).toEqual({ gold: 0, hot: 0 })
+    expect(coins(1)).toEqual({ gold: 1, hot: 0 })
+    expect(coins(2)).toEqual({ gold: 2, hot: 0 })
+    expect(coins(3).gold).toBe(1)
+    expect(coins(3).hot).toBe(0)
+    for (const p of [4, 7, Number.POSITIVE_INFINITY]) {
+      expect(coins(p).gold).toBe(0)
+      expect(coins(p).hot).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe("coin pile", () => {
+  test("stays within a 6x6 box", () => {
+    for (const n of [0, 1, 2, 3, 7, -1, Number.NaN]) {
+      const { ctx, rects } = fakeCtx()
+      expect(() => drawCoins(ctx, 30, 40, n)).not.toThrow()
+      expectPixelArt(rects, 30, 40, 6, 6)
+    }
+  })
+
+  test("draws nothing at 0 and one coin rim per coin, capped at 3", () => {
+    const rims = (n: number) => {
+      const { ctx, rects } = fakeCtx()
+      drawCoins(ctx, 0, 0, n)
+      return { rims: countStyle(rects, PAL.coinEdge) + countStyle(rects, PAL.coinDark), total: rects.length }
+    }
+    expect(rims(0)).toEqual({ rims: 0, total: 0 })
+    expect(rims(-2).total).toBe(0)
+    for (const n of [1, 2, 3]) expect(rims(n).rims).toBe(n)
+    expect(rims(12).rims).toBe(3)
+  })
 })

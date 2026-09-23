@@ -25,6 +25,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: {},
     start: { ...body(70, 70, 85), social: 60, fun: 55, purpose: 55, respect: 60 },
+    coins: 12,
   },
   {
     id: "tomas",
@@ -42,6 +43,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: {},
     start: { ...body(65, 60, 80), social: 55, fun: 50, purpose: 50, respect: 45 },
+    coins: 14,
   },
   {
     id: "mo",
@@ -59,6 +61,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: {},
     start: { ...body(70, 60, 80), social: 40, fun: 60, purpose: 55, respect: 60 },
+    coins: 10,
   },
   {
     id: "pip",
@@ -77,6 +80,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: { hunger: 1.3 },
     start: { ...body(45, 70, 85), social: 60, fun: 55, purpose: 55, respect: 55 },
+    coins: 12,
   },
   {
     id: "juniper",
@@ -94,6 +98,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: { energy: 1.1 },
     start: { ...body(65, 55, 90), social: 70, fun: 35, purpose: 55, respect: 55 },
+    coins: 8,
   },
   {
     id: "bram",
@@ -111,13 +116,14 @@ export const PERSONAS: Persona[] = [
     }),
     decay: { energy: 1.4 },
     start: { ...body(60, 65, 55), social: 70, fun: 60, purpose: 50, respect: 70 },
+    coins: 18,
   },
   {
     id: "sable",
     name: "Sable",
-    vocation: "keeper of the village store",
-    craft: "keep_store",
-    blurb: "A sharp, ambitious trader who keeps the village store's tally.",
+    vocation: "shopkeeper",
+    craft: "keep_shop",
+    blurb: "A sharp, ambitious trader who runs the market stall and sets its prices.",
     colors: { hair: "#1c1c22", skin: "#e2b894", shirt: "#7a2438", pants: "#24242c" },
     psyche: makePsyche({
       big5: { agreeableness: 15, conscientiousness: 62, extraversion: 55 },
@@ -131,6 +137,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: {},
     start: { ...body(60, 60, 80), social: 55, fun: 55, purpose: 50, respect: 55 },
+    coins: 30,
   },
   {
     id: "hollis",
@@ -148,6 +155,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: { energy: 0.9 },
     start: { ...body(60, 60, 75), social: 55, fun: 45, purpose: 55, respect: 55 },
+    coins: 6,
   },
   {
     id: "odile",
@@ -165,6 +173,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: {},
     start: { ...body(65, 65, 80), social: 60, fun: 55, purpose: 60, respect: 65 },
+    coins: 12,
   },
   {
     id: "lark",
@@ -182,6 +191,7 @@ export const PERSONAS: Persona[] = [
     }),
     decay: {},
     start: { ...body(65, 60, 80), social: 55, fun: 45, purpose: 55, respect: 55 },
+    coins: 8,
   },
 ]
 

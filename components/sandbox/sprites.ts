@@ -54,6 +54,24 @@ export const PAL = {
   barTrack: "#3b4252",
   barFill: "#58d858",
   barLight: "#a8f0a0",
+  // Market stall awning: teal and cream stripes, kept apart from the red roofs and the thatch.
+  awning: "#38b3a4",
+  awningLight: "#7fdccb",
+  awningDark: "#23847a",
+  cream: "#f6e8bc",
+  creamLight: "#fff8e2",
+  creamDark: "#d9c48e",
+  stallBack: "#4a2e18",
+  stallBackDark: "#382210",
+  // Coins: gold for a fair price, hot orange and red once the price is gouging.
+  coin: "#ffd866",
+  coinShine: "#fff6d0",
+  coinEdge: "#e8a830",
+  coinDark: "#c8841c",
+  coinHot: "#ff9a2e",
+  coinHotShine: "#fff0a0",
+  coinHotEdge: "#ff5a1e",
+  coinHotDark: "#b8200e",
 } as const
 
 /** Paint a character map. `flip` mirrors horizontally. "." is transparent. */
@@ -682,6 +700,143 @@ export function drawCarry(ctx: Ctx, px: number, py: number, n: number) {
 }
 
 // ---------------------------------------------------------------------------
+// Market stall (2x1 tiles) and coin piles
+
+// 32x19 stall painted from 4 px above the tile: striped awning with a scalloped valance,
+// two posts, a dark plank back wall and a plank counter. Food and coins are drawn on top.
+const STALL: PixelMap = [
+  ".kkkkkkkkkkkkkkkkkkkkkkkkkkkkkk.",
+  "kaaaaaccccaaaaccccaaaaccccaaaaak",
+  "ktttttmmmmttttmmmmttttmmmmtttttk",
+  "ktttttmmmmttttmmmmttttmmmmtttttk",
+  "kTTTTTMMMMTTTTMMMMTTTTMMMMTTTTTk",
+  ".kkTTkkMMkkTTkkMMkkTTkkMMkkTTkk.",
+  "..kwdkbkkbbkkbbkkbbkkbbkkbkwdk..",
+  "..kwdkbbbbbBbbbbbbbbBbbbbbkwdk..",
+  "..kwdkbbbbbBbbbbbbbbBbbbbbkwdk..",
+  "..kwdkbbbbbBbbbbbbbbBbbbbbkwdk..",
+  "..kwdkBBBBBBBBBBBBBBBBBBBBkwdk..",
+  ".kkkkkkkkkkkkkkkkkkkkkkkkkkkkkk.",
+  ".kppppppppppppppppppppppppppppk.",
+  ".kPPPPPPPPPPPPPPPPPPPPPPPPPPPPk.",
+  ".kkkkkkkkkkkkkkkkkkkkkkkkkkkkkk.",
+  ".kpPPPPqpPPPqpPPPPPqpPPPqpPPPPk.",
+  ".kpPPPPqpPPPqpPPPPPqpPPPqpPPPPk.",
+  ".kqqqqqqqqqqqqqqqqqqqqqqqqqqqqk.",
+  ".kkkkkkkkkkkkkkkkkkkkkkkkkkkkkk.",
+]
+const STALL_OVERHANG = 4
+const STALL_COLORS: Record<string, string> = {
+  k: PAL.outline,
+  a: PAL.awningLight,
+  t: PAL.awning,
+  T: PAL.awningDark,
+  c: PAL.creamLight,
+  m: PAL.cream,
+  M: PAL.creamDark,
+  w: PAL.wood,
+  d: PAL.woodDark,
+  b: PAL.stallBack,
+  B: PAL.stallBackDark,
+  p: PAL.plankLight,
+  P: PAL.plank,
+  q: PAL.plankDark,
+}
+
+// Food heap on the counter, a 4-3-1 pyramid; fills the bottom row from the centre out.
+const STALL_FOOD_SPOTS: readonly (readonly [number, number])[] = [
+  [8, 6],
+  [10, 6],
+  [6, 6],
+  [12, 6],
+  [9, 4],
+  [7, 4],
+  [11, 4],
+  [9, 2],
+]
+
+// Small upright coin with a slot, used for fair prices on the counter. The rim is dark gold so the
+// coin stays round against the dark back wall; the bottom row is a contact shadow on the counter.
+const COIN: PixelMap = [".ddd.", "dwyyd", "dyoyd", "dyyyd", ".kkk."]
+const COIN_COLORS = { k: PAL.outline, w: PAL.coinShine, y: PAL.coin, d: PAL.coinDark, o: PAL.coinEdge }
+
+type CoinTone = { face: string; shine: string; edge: string; dark: string }
+const GOLD: CoinTone = { face: PAL.coin, shine: PAL.coinShine, edge: PAL.coinEdge, dark: PAL.coinDark }
+const HOT: CoinTone = { face: PAL.coinHot, shine: PAL.coinHotShine, edge: PAL.coinHotEdge, dark: PAL.coinHotDark }
+
+/** A 5 px wide stack of `n` flat coins whose bottom outline sits on row `bottom`; n + 3 rows tall. */
+function drawCoinStack(ctx: Ctx, x: number, bottom: number, n: number, tone: CoinTone) {
+  const top = bottom - n - 2
+  ctx.fillStyle = PAL.outline
+  ctx.fillRect(x + 1, top, 3, 1)
+  ctx.fillRect(x, top + 1, 5, n + 1)
+  ctx.fillRect(x + 1, bottom, 3, 1)
+  ctx.fillStyle = tone.face
+  ctx.fillRect(x + 1, top + 1, 3, 1)
+  ctx.fillStyle = tone.shine
+  ctx.fillRect(x + 1, top + 1, 1, 1)
+  // One rim row per coin, alternating shades so the coins read as separate.
+  for (let i = 0; i < n; i++) {
+    ctx.fillStyle = i % 2 ? tone.dark : tone.edge
+    ctx.fillRect(x + 1, top + 2 + i, 3, 1)
+  }
+}
+
+/** 0 = free (no marker), 1 = one coin, 2 = two coins, 3 = a gold stack, 4 = gouging. */
+function priceTier(price: number): 0 | 1 | 2 | 3 | 4 {
+  if (Number.isNaN(price) || price <= 0) return 0
+  if (price >= 4) return 4
+  return Math.min(3, Math.max(1, Math.round(price))) as 1 | 2 | 3
+}
+
+/**
+ * A 32x16 market stall (2x1 tiles); the awning overhangs 4 px above `py`. The counter shows
+ * up to 8 food items, and the coins beside them grow with `price`: one gold coin at 1, two at 2,
+ * a gold stack at 3, and a hot orange and red pile at 4 or more so gouging stands out.
+ */
+export function drawStall(ctx: Ctx, px: number, py: number, food: number, price: number) {
+  ctx.fillStyle = "rgba(0,0,0,0.22)"
+  ctx.fillRect(px + 2, py + 15, 28, 1)
+  paint(ctx, STALL, STALL_COLORS, px, py - STALL_OVERHANG)
+
+  const n = Number.isFinite(food) ? Math.max(0, Math.min(STALL_FOOD_SPOTS.length, Math.floor(food))) : 0
+  const spots = STALL_FOOD_SPOTS.slice(0, n)
+  // Shared outline first so the heap reads as one pile, then the berries.
+  ctx.fillStyle = PAL.outline
+  for (const [bx, by] of spots) {
+    ctx.fillRect(px + bx - 1, py + by, 4, 2)
+    ctx.fillRect(px + bx, py + by - 1, 2, 4)
+  }
+  for (const [bx, by] of spots) {
+    ctx.fillStyle = PAL.berry
+    ctx.fillRect(px + bx, py + by, 2, 2)
+    ctx.fillStyle = PAL.berryLight
+    ctx.fillRect(px + bx, py + by, 1, 1)
+    ctx.fillStyle = PAL.berryDark
+    ctx.fillRect(px + bx + 1, py + by + 1, 1, 1)
+  }
+
+  // Price marker on the right of the counter; every tier sits on counter row 8.
+  const tier = priceTier(price)
+  if (tier === 1) paint(ctx, COIN, COIN_COLORS, px + 19, py + 4)
+  else if (tier === 2) {
+    paint(ctx, COIN, COIN_COLORS, px + 17, py + 4)
+    paint(ctx, COIN, COIN_COLORS, px + 21, py + 4)
+  } else if (tier === 3) drawCoinStack(ctx, px + 19, py + 8, 3, GOLD)
+  else if (tier === 4) {
+    drawCoinStack(ctx, px + 17, py + 8, 3, HOT)
+    drawCoinStack(ctx, px + 21, py + 8, 2, HOT)
+  }
+}
+
+/** A coin pile in a 6x6 box at (px, py): a stack of 1 to 3 gold coins on the bottom row, none at 0. */
+export function drawCoins(ctx: Ctx, px: number, py: number, n: number) {
+  const count = Number.isFinite(n) ? Math.max(0, Math.min(3, Math.floor(n))) : 0
+  if (count === 0) return
+  drawCoinStack(ctx, px, py + 5, count, GOLD)
+}
+
+// ---------------------------------------------------------------------------
 // Characters: 16x16, 2-frame walk, left is a mirrored right.
 
 const FRONT: PixelMap = [
@@ -874,5 +1029,7 @@ export const PIXEL_MAPS: Record<string, { map: PixelMap; width: number }> = {
   BASKET: { map: BASKET, width: 16 },
   STAKE: { map: STAKE, width: 3 },
   GRANARY_EMBLEM: { map: GRANARY_EMBLEM, width: 10 },
+  STALL: { map: STALL, width: 32 },
+  COIN: { map: COIN, width: 5 },
   ...Object.fromEntries(Object.entries(ICONS).map(([k, v]) => [`ICON_${k}`, { map: v.map, width: 7 }])),
 }

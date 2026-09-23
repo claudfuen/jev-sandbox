@@ -77,6 +77,7 @@ function AgentHeader({ agent, world }: { world: World; agent: Agent }) {
             <h2 className="text-base font-semibold">{agent.persona.name}</h2>
             <span className="text-xs text-muted-foreground">{agent.persona.vocation}</span>
             {agent.mood && <Badge variant="secondary">feeling {agent.mood.label}</Badge>}
+            <Badge variant="outline">{agent.coins} coins</Badge>
             {agent.carry > 0 && <Badge variant="outline">carrying {agent.carry} food</Badge>}
           </div>
           <p className="text-[13px] leading-snug text-muted-foreground">{agent.persona.blurb}</p>
@@ -179,8 +180,25 @@ function MindTab({ agent }: { agent: Agent }) {
 }
 
 function RelationsTab({ world, agent }: { world: World; agent: Agent }) {
+  const debts = world.debts.filter((d) => d.creditorId === agent.id || d.debtorId === agent.id)
+  const nameOf = (id: string) => world.agents.find((a) => a.id === id)?.persona.name ?? id
   return (
     <div className="flex flex-col gap-5">
+      {debts.length > 0 && (
+        <Section title="Debts">
+          <ul className="flex flex-col gap-1 text-sm">
+            {debts.map((d) => (
+              <li key={d.id} className="flex items-baseline justify-between gap-2">
+                <span>
+                  {d.debtorId === agent.id ? `Owes ${nameOf(d.creditorId)}` : `${nameOf(d.debtorId)} owes them`} {d.owed} coins
+                  <span className="text-xs text-muted-foreground"> (lent {d.lent})</span>
+                </span>
+                <Badge variant={d.state === "defaulted" ? "destructive" : d.state === "repaid" ? "secondary" : "outline"}>{d.state}</Badge>
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
       <Section title="Feelings about others">
         <div className="flex flex-col gap-2">
           {world.agents
@@ -263,6 +281,27 @@ function PsycheTab({ agent }: { agent: Agent }) {
               </Badge>
             ))}
         </div>
+      </Section>
+      <Section title="How they have changed" aside={<span className="text-xs text-muted-foreground">habit and experience</span>}>
+        {agent.drift.length ? (
+          <ol className="flex flex-col gap-1 text-sm">
+            {[...agent.drift].reverse().slice(0, 12).map((d, i) => (
+              <li key={`${d.tick}-${d.key}-${i}`} className="grid grid-cols-[4.5rem_8.5rem_3rem_1fr] items-baseline gap-2">
+                <span className="text-xs text-muted-foreground tabular-nums">{formatTime(d.tick)}</span>
+                <span className="truncate">{d.key.replace(/^(big5|values|foundations|dark)\./, "")}</span>
+                <span className={cn("text-right text-xs tabular-nums", d.delta > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400")}>
+                  {d.delta > 0 ? "+" : ""}
+                  {d.delta.toFixed(1)}
+                </span>
+                <span className="truncate text-xs text-muted-foreground" title={d.cause}>
+                  {d.cause}
+                </span>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="text-sm text-muted-foreground">No changes yet. Personalities shift slowly with what people do and what happens to them.</p>
+        )}
       </Section>
       <Section title="What their choices were about" aside={<span className="text-xs text-muted-foreground">tagged by the engine</span>}>
         {drivers.length ? (

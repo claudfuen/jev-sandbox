@@ -16,6 +16,7 @@ import {
 } from "./geometry"
 import { JOBS, onShift, shiftPhrase, weekday, WEEKDAY_NAMES, type Job } from "./jobs"
 import { buildTownMap, idx, isWalkable, MAP_W, tileAt } from "./map"
+import { GRAVE_SLOTS } from "./town-map"
 import { FOUNDING_MEMORIES, foundingAffinity, isChild, PERSONAS } from "./personas"
 import { habit, lifeEvent, reflectDrift } from "./drift"
 import { needRates, psycheLines } from "./psyche"
@@ -23,7 +24,9 @@ import type {
   Agent,
   Building,
   BuildingKind,
+  Case,
   ChoiceMode,
+  Crime,
   DecisionRecord,
   DriverKey,
   Intent,
@@ -107,6 +110,8 @@ const ACT_TICKS = {
   read_board: 2,
   cook_home: 6,
   stock_home: 1,
+  open_case: 1,
+  drop_case: 1,
 } satisfies Record<Exclude<Intent["kind"], "sleep" | "approach">, number>
 const CHAT_TICKS = 6
 const COLLAPSE_TICKS = 36
@@ -169,6 +174,8 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
       meaning: null,
       grudges: [],
       gratitude: [],
+      knows: [],
+      grieving: [],
       status: { kind: "idle", retryAt: 0 },
       memory: [
         ...(FOUNDING_MEMORIES[persona.id] ?? []).map((text) => ({ tick: 0, text })),
@@ -235,6 +242,9 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
     edition: null,
     debts: [],
     lies: [],
+    crimes: [],
+    cases: [],
+    graves: [],
     favors: {},
     agents,
     log: [{ tick: 0, text: `A new ${WEEKDAY_NAMES[0]} begins in Fernhollow.`, agentIds: [], tone: "info" }],
@@ -622,6 +632,9 @@ function goalFor(world: World, agent: Agent, intent: Intent): (p: Vec) => boolea
       return atDoor(buildingOf(world, "school"))
     case "read_board":
       return (p) => adjacent(p, world.board)
+    case "open_case":
+    case "drop_case":
+      return () => true
   }
 }
 
@@ -655,6 +668,8 @@ function happensInside(world: World, agent: Agent, intent: Intent): string | nul
       return world.pantry.buildingId
     case "rest":
     case "eat_carry":
+    case "open_case":
+    case "drop_case":
       return agent.insideOf
     default:
       return null
@@ -707,6 +722,9 @@ function intentPhrase(world: World, intent: Intent, viewer?: Agent): string {
       return "school"
     case "read_board":
       return "the notice board"
+    case "open_case":
+    case "drop_case":
+      return "police work"
   }
 }
 
@@ -780,6 +798,9 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
           return "cooking at home"
         case "stock_home":
           return "putting food away at home"
+        case "open_case":
+        case "drop_case":
+          return "doing police paperwork"
         case "approach":
           return `talking with ${who(s.intent.targetId)}`
         default:
@@ -795,6 +816,12 @@ export function describeStatus(world: World, agent: Agent, viewer?: Agent): stri
       return "asleep at home"
     case "collapsed":
       return "collapsed on the ground, too weak to move"
+    case "jailed":
+      return "locked in the police station cell"
+    case "fighting":
+      return `fighting with ${who(s.targetId)}`
+    case "dead":
+      return "dead"
   }
 }
 
@@ -855,6 +882,7 @@ function canApproach(target: Agent): boolean {
 
 /** Honest sight: people in the same building, or outdoors within sight. */
 function canSee(viewer: Agent, other: Agent): boolean {
+  if (other.status.kind === "dead") return false
   if (viewer.insideOf || other.insideOf) return viewer.insideOf !== null && viewer.insideOf === other.insideOf
   return manhattan(viewer.pos, other.pos) <= SIGHT_RADIUS
 }
@@ -982,6 +1010,7 @@ export function perceive(world: World, agent: Agent, askedBy?: Agent): Perceptio
       .slice(0, 8)
       .map((a) => {
         const extra = agent.grudges.includes(a.id) ? "; you hold a grudge against them" : agent.gratitude.includes(a.id) ? "; you feel grateful to them" : ""
+        if (a.status.kind === "dead") return `${a.persona.name} (now dead, ${a.status.cause}): ${affinityWords(agent.affinity[a.id] ?? 0)}${extra}.`
         return `${a.persona.name}: ${affinityWords(agent.affinity[a.id] ?? 0)}${extra}.`
       }),
   }
@@ -995,7 +1024,7 @@ function lastVisitPhrase(world: World, agent: Agent, poiId: string): string {
 }
 
 /** Option ids a child is never offered (stage gates). */
-const ADULT_ONLY = /^(lie_|lend_|usury_|pickpocket_|take_store|sell|work_|build|price_|demand_)/
+const ADULT_ONLY = /^(lie_|lend_|usury_|pickpocket_|take_store|sell|work_|build|price_|demand_|shove_|attack_|kill_|arrest_|fine_|warn_|drop_|open_)/
 
 export function buildOptions(world: World, agent: Agent): OptionSpec[] {
   const field = distanceField(world.tiles, agent.pos)
@@ -1336,6 +1365,109 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
     }
   }
 
+  // Justice: report what you know; the officer acts on cases.
+  const officer = officerOf(world)
+  if (officer && officer.id !== agent.id) {
+    const reportable = agent.knows
+      .map((id) => world.crimes.find((c) => c.id === id)!)
+      .filter((c) => c && c.culpritId !== agent.id && !caseFor(world, c.id) && world.tick - c.tick < 576)
+      .slice(-2)
+    for (const crime of reportable) {
+      if (!canApproach(officer)) break
+      add({
+        id: `report_${crime.id}`,
+        label: `Report ${nameOf(world, crime.culpritId)} to ${officer.persona.name}, the police officer`,
+        detail: `What you know: ${crime.summary} ${officer.persona.name} is ${manhattan(agent.pos, officer.pos)} steps away. It is up to ${officer.persona.name} what happens next.`,
+        intent: { kind: "approach", targetId: officer.id, offer: { kind: "report", crimeId: crime.id } },
+        drivers: ["justice"],
+      })
+    }
+  }
+  if (agent.persona.job === "police_officer") {
+    for (const id of agent.knows) {
+      const crime = world.crimes.find((c) => c.id === id)
+      if (!crime || crime.culpritId === agent.id || caseFor(world, crime.id) || world.tick - crime.tick > 576) continue
+      add({
+        id: `open_${crime.id}`,
+        label: `Open a case against ${nameOf(world, crime.culpritId)}`,
+        detail: `You know this yourself: ${crime.summary}`,
+        intent: { kind: "open_case", crimeId: crime.id },
+        drivers: ["justice", "duty"],
+      })
+    }
+    for (const c of world.cases.filter((x) => x.state === "open").slice(0, 3)) {
+      const crime = world.crimes.find((x) => x.id === c.crimeId)!
+      const suspect = agentById(world, c.suspectId)
+      if (!isAlive(suspect)) continue
+      const reachable = canApproach(suspect)
+      const where = reachable ? `${suspect.persona.name} is ${manhattan(agent.pos, suspect.pos)} steps away.` : `${suspect.persona.name} is not somewhere you can reach right now.`
+      if (reachable) {
+        add({
+          id: `arrest_${c.id}`,
+          label: `Arrest ${suspect.persona.name} for a night in the station cell`,
+          detail: `The case: ${crime.summary} ${where}`,
+          intent: { kind: "approach", targetId: suspect.id, offer: { kind: "arrest", caseId: c.id } },
+          drivers: ["justice", "duty"],
+        })
+        if (crime.kind !== "murder") {
+          const amount = crime.kind === "pickpocket" ? 10 : crime.kind === "pantry_theft" ? 8 : 20
+          add({
+            id: `fine_${c.id}`,
+            label: `Fine ${suspect.persona.name} ${amount} coins`,
+            detail: `Paid to the victim, or to the town if there is none. The case: ${crime.summary} ${where}`,
+            intent: { kind: "approach", targetId: suspect.id, offer: { kind: "fine", caseId: c.id, amount } },
+            drivers: ["justice"],
+          })
+          add({
+            id: `warn_${c.id}`,
+            label: `Give ${suspect.persona.name} a formal warning`,
+            detail: `No punishment beyond the shame of it. The case: ${crime.summary} ${where}`,
+            intent: { kind: "approach", targetId: suspect.id, offer: { kind: "warn", caseId: c.id } },
+            drivers: ["justice"],
+          })
+        }
+      }
+      add({
+        id: `drop_${c.id}`,
+        label: `Drop the case against ${suspect.persona.name}`,
+        detail: `Let it go. ${nameOf(world, c.reporterId)} reported it.`,
+        intent: { kind: "drop_case", caseId: c.id },
+        drivers: [],
+      })
+    }
+  }
+
+  // Violence, offered only toward an adult within reach. Killing is only considered where there is real hatred.
+  const foe = world.agents
+    .filter((o) => o.id !== agent.id && !isChild(o.persona) && canApproach(o) && manhattan(agent.pos, o.pos) <= 8)
+    .sort((a, b) => (agent.affinity[a.id] ?? 0) - (agent.affinity[b.id] ?? 0))[0]
+  if (foe && !child) {
+    const nm = foe.persona.name
+    add({
+      id: `shove_${foe.id}`,
+      label: `Shove ${nm} in anger`,
+      detail: `A hard shove, not meant to do real harm. ${nm} may fight back, and anyone who sees will remember it.`,
+      intent: { kind: "approach", targetId: foe.id, offer: { kind: "attack", severity: "shove" } },
+      drivers: ["confrontation", "violence"],
+    })
+    add({
+      id: `attack_${foe.id}`,
+      label: `Attack ${nm} to hurt them`,
+      detail: `Real violence that could injure ${nm} badly. It is a crime: if anyone sees, the police may come for you.`,
+      intent: { kind: "approach", targetId: foe.id, offer: { kind: "attack", severity: "hurt" } },
+      drivers: ["violence"],
+    })
+    if (agent.grudges.includes(foe.id) || (agent.affinity[foe.id] ?? 0) <= -0.4) {
+      add({
+        id: `kill_${foe.id}`,
+        label: `Try to kill ${nm}`,
+        detail: `This could end ${nm}'s life. Murder is the worst crime there is: if you are seen or found out, you will be arrested and the town may never forgive you.`,
+        intent: { kind: "approach", targetId: foe.id, offer: { kind: "attack", severity: "kill" } },
+        drivers: ["violence"],
+      })
+    }
+  }
+
   // Leisure.
   add({
     id: "plaza",
@@ -1381,6 +1513,97 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
 }
 
 // ---------------------------------------------------------------------------
+// Crime, justice, violence and death
+
+const isAlive = (a: Agent | undefined): a is Agent => !!a && a.status.kind !== "dead"
+const officerOf = (world: World) => world.agents.find((a) => a.persona.job === "police_officer" && isAlive(a))
+const DAMAGE = { shove: 6, hurt: 18, kill: 30 } as const
+
+/** Record a crime; only the knowers learn of it. */
+function recordCrime(
+  world: World,
+  kind: Crime["kind"],
+  culprit: Agent,
+  victim: Agent | null,
+  summary: string,
+  knowers: Agent[],
+): Crime {
+  const crime: Crime = {
+    id: `crime_${world.crimes.length + 1}`,
+    kind,
+    culpritId: culprit.id,
+    victimId: victim?.id ?? null,
+    tick: world.tick,
+    place: describeLocation(world, culprit),
+    summary,
+  }
+  world.crimes.push(crime)
+  for (const k of new Set([culprit, ...knowers])) if (!k.knows.includes(crime.id)) k.knows.push(crime.id)
+  count(world, `crime_${kind}`)
+  return crime
+}
+
+const caseFor = (world: World, crimeId: string) => world.cases.find((c) => c.crimeId === crimeId)
+
+/** Tomorrow at 8 am, as a tick: when the cell is unlocked. */
+function nextMorning(world: World): number {
+  const { day } = clockOf(world.tick)
+  return Math.round((day * 1440 + 8 * 60 - 7 * 60) / 5)
+}
+
+function die(world: World, agent: Agent, cause: string, culprit: Agent | null) {
+  const slot = GRAVE_SLOTS.find((p) => !world.graves.some((g) => sameTile(g.pos, p))) ?? GRAVE_SLOTS[0]
+  const seenBy = witnessesOf(world, agent)
+  agent.status = { kind: "dead", tick: world.tick, cause }
+  agent.inside = false
+  agent.insideOf = null
+  agent.carry = 0
+  world.graves.push({ agentId: agent.id, pos: { ...slot }, tick: world.tick, cause })
+  world.tiles[idx(slot.x, slot.y)] = "grave"
+  count(world, "deaths")
+  log(world, `${agent.persona.name} has died (${cause}).`, [agent.id, ...(culprit ? [culprit.id] : [])], "conflict")
+  if (culprit) {
+    const crime = recordCrime(world, "murder", culprit, agent, `${culprit.persona.name} killed ${agent.persona.name} ${describeLocation(world, culprit)}.`, seenBy)
+    void crime
+  }
+  for (const d of world.debts) if (d.state === "open" && (d.debtorId === agent.id || d.creditorId === agent.id)) d.state = "defaulted"
+  for (const other of world.agents) {
+    if (other.id === agent.id || !isAlive(other)) continue
+    const saw = seenBy.includes(other)
+    remember(
+      world,
+      other,
+      saw && culprit
+        ? `You saw ${culprit.id === other.id ? "yourself" : culprit.persona.name} kill ${agent.persona.name}.`
+        : `${agent.persona.name} has died.`,
+    )
+    if ((other.affinity[agent.id] ?? 0) >= 0.3 || homeOf(world, other).residents.includes(agent.id)) {
+      other.grieving.push(agent.id)
+      other.needs.social = clamp(other.needs.social - 20)
+      other.needs.fun = clamp(other.needs.fun - 20)
+      other.needCause.social = `you are grieving ${agent.persona.name}`
+      remember(world, other, `You are grieving ${agent.persona.name}.`)
+      if (culprit && culprit.id !== other.id && saw) nudgeAffinity(other, culprit.id, -0.6)
+    }
+  }
+}
+
+/** Physics of one exchange of violence. Returns the target's health after it. */
+function blow(world: World, attacker: Agent, target: Agent, severity: "shove" | "hurt" | "kill", reaction: string): number {
+  let damage: number = DAMAGE[severity]
+  if (reaction === "fight_back") {
+    damage *= 0.7
+    attacker.needs.health = clamp(attacker.needs.health - 10)
+  } else if (reaction === "flee") damage *= 0.5
+  target.needs.health = clamp(target.needs.health - damage)
+  target.needCause.health = `${attacker.persona.name} ${severity === "shove" ? "shoved" : "attacked"} you`
+  count(world, "blows")
+  flash(world, attacker, "angry", 4)
+  flash(world, target, "sweat", 6)
+  return target.needs.health
+}
+
+// ---------------------------------------------------------------------------
 // Transitions
 
 function becomeIdle(world: World, agent: Agent, delay = 0) {
@@ -1390,7 +1613,7 @@ function becomeIdle(world: World, agent: Agent, delay = 0) {
 function startIntent(world: World, agent: Agent, intent: Intent) {
   // Leave the building they are in, unless the next thing happens right here.
   if (agent.insideOf && happensInside(world, agent, intent) !== agent.insideOf) leave(agent)
-  if (intent.kind === "rest" || intent.kind === "eat_carry") {
+  if (intent.kind === "rest" || intent.kind === "eat_carry" || intent.kind === "open_case" || intent.kind === "drop_case") {
     agent.status = { kind: "acting", intent, ticksLeft: ACT_TICKS[intent.kind] }
     return
   }
@@ -1412,7 +1635,7 @@ function startIntent(world: World, agent: Agent, intent: Intent) {
 /** Who can see `agent` right now: others in the same building, or awake outdoors within range. */
 function witnessesOf(world: World, agent: Agent): Agent[] {
   return world.agents.filter((o) => {
-    if (o.id === agent.id || o.status.kind === "sleeping" || o.status.kind === "collapsed") return false
+    if (o.id === agent.id || o.status.kind === "sleeping" || o.status.kind === "collapsed" || o.status.kind === "dead") return false
     if (agent.insideOf || o.insideOf) return agent.insideOf !== null && o.insideOf === agent.insideOf
     const onPatrol = o.persona.job === "police_officer" && (o.status.kind === "moving" || o.status.kind === "acting") && "intent" in o.status && o.status.intent.kind === "work"
     return manhattan(o.pos, agent.pos) <= (onPatrol ? PATROL_WITNESS_RADIUS : WITNESS_RADIUS)
@@ -1554,6 +1777,7 @@ function arrive(world: World, agent: Agent, intent: Intent) {
           }
         }
         if (!needy) {
+          recordCrime(world, "pantry_theft", agent, null, `${agent.persona.name} took food from the chapel pantry without being in need.`, seenBy)
           count(world, "thefts_seen")
           agent.needs.respect = clamp(agent.needs.respect - 8)
           agent.needCause.respect = `${who} saw you take from the pantry though you did not need it`
@@ -1786,6 +2010,28 @@ function finishActing(world: World, agent: Agent, intent: Intent) {
     case "eat_carry":
       remember(world, agent, "You ate some of the food you were carrying.")
       break
+    case "open_case": {
+      const crime = world.crimes.find((c) => c.id === intent.crimeId)
+      if (crime && !caseFor(world, crime.id)) {
+        world.cases.push({ id: `case_${world.cases.length + 1}`, crimeId: crime.id, suspectId: crime.culpritId, reporterId: agent.id, openedTick: world.tick, state: "open" })
+        count(world, "cases_opened")
+        remember(world, agent, `You opened a case against ${nameOf(world, crime.culpritId)}: ${crime.summary}`)
+        log(world, `${agent.persona.name} opened a case against ${nameOf(world, crime.culpritId)}.`, [agent.id, crime.culpritId], "conflict")
+      }
+      break
+    }
+    case "drop_case": {
+      const c = world.cases.find((x) => x.id === intent.caseId)
+      if (c && c.state === "open") {
+        c.state = "dropped"
+        count(world, "cases_dropped")
+        remember(world, agent, `You dropped the case against ${nameOf(world, c.suspectId)}.`)
+        const reporter = agentById(world, c.reporterId)
+        if (reporter && reporter.id !== agent.id) remember(world, reporter, `${agent.persona.name} dropped the case against ${nameOf(world, c.suspectId)}.`)
+        log(world, `${agent.persona.name} dropped the case against ${nameOf(world, c.suspectId)}.`, [agent.id, c.suspectId], "info")
+      }
+      break
+    }
     case "deposit":
     case "take_store":
     case "buy":
@@ -1838,6 +2084,21 @@ function wireOffer(world: World, offer: Offer): OfferWire {
       return { kind: "lend", amount: offer.amount, owed: offer.owed }
     case "demand_repay":
       return { kind: "demand_repay", owed: world.debts.find((d) => d.id === offer.debtId)?.owed ?? 1 }
+    case "report": {
+      const crime = world.crimes.find((c) => c.id === offer.crimeId)
+      return { kind: "report", accused: nameOf(world, crime?.culpritId ?? ""), crime: crime?.summary ?? "something happened." }
+    }
+    case "arrest":
+    case "warn":
+    case "fine": {
+      const c = world.cases.find((x) => x.id === offer.caseId)
+      const crime = world.crimes.find((x) => x.id === c?.crimeId)
+      const summary = crime?.summary ?? "a crime."
+      if (offer.kind === "fine") return { kind: "fine", amount: offer.amount, crime: summary, victim: crime?.victimId ? nameOf(world, crime.victimId) : "the town" }
+      return { kind: offer.kind, crime: summary }
+    }
+    case "attack":
+      return { kind: "attack", severity: offer.severity }
     default:
       throw new Error(`Offer ${offer.kind} does not ask for a reply`)
   }
@@ -1899,6 +2160,7 @@ function actOnArrival(world: World, agent: Agent, target: Agent, offer: Offer): 
           flash(world, w, "eye", 6)
         }
         lifeEvent(world, agent, "caught", "caught picking a pocket")
+        recordCrime(world, "pickpocket", agent, target, `${agent.persona.name} picked ${target.persona.name}'s pocket and took ${n} coins.`, [...(targetNoticed ? [target] : []), ...seenBy])
         log(world, `${names(world, who.map((w) => w.id))} saw ${agent.persona.name} pick ${target.persona.name}'s pocket.`, [agent.id, target.id], "conflict")
       } else {
         count(world, "pickpockets_unseen")
@@ -1982,15 +2244,18 @@ type ReflectFields = {
   askGoal: boolean
   currentGoal: string | null
 }
+type PressFields = { targetId: string; severity: "hurt" | "kill"; targetHealth: number; reaction: string }
 export type SimRequest =
   | (RequestBase & { kind: "decide"; options: OptionSpec[] })
   | (RequestBase & { kind: "respond" } & RespondFields)
   | (RequestBase & { kind: "reflect" } & ReflectFields)
+  | (RequestBase & { kind: "press" } & PressFields)
 
 type RequestInit =
   | { kind: "decide"; agentId: string; perception: Perception; options: OptionSpec[] }
   | ({ kind: "respond"; agentId: string; perception: Perception } & RespondFields)
   | ({ kind: "reflect"; agentId: string; perception: Perception } & ReflectFields)
+  | ({ kind: "press"; agentId: string; perception: Perception } & PressFields)
 
 /** Every JEV request gets a deterministic id so recorded answers can be matched on replay. */
 function issue(world: World, init: RequestInit): SimRequest {
@@ -2138,7 +2403,7 @@ function townDay(world: World) {
     }
     for (const agent of world.agents) {
       const job = jobOf(agent)
-      if (!job) continue
+      if (!job || !isAlive(agent)) continue
       const due = job.shift.days.includes(weekday(day)) ? Math.round((job.shift.end - job.shift.start) / 5) : 0
       const worked = town.worked[agent.id] ?? 0
       if (due > 0) {
@@ -2222,13 +2487,14 @@ export function step(world: World): SimRequest[] {
   }
 
   for (const agent of world.agents) {
+    if (agent.status.kind === "dead") continue
     decayNeeds(world, agent)
     // Hours on the job, for 6 pm payroll: working, or walking the beat.
     const st = agent.status
     if ((st.kind === "acting" || (st.kind === "moving" && agent.persona.job === "police_officer")) && st.intent.kind === "work") {
       world.town.worked[agent.id] = (world.town.worked[agent.id] ?? 0) + 1
     }
-    if (agent.needs.health <= 0 && agent.status.kind !== "collapsed" && !agent.inside) collapse(world, agent)
+    if (agent.needs.health <= 0 && agent.status.kind !== "collapsed" && agent.status.kind !== "jailed" && !agent.inside) collapse(world, agent)
     const s = agent.status
     switch (s.kind) {
       case "idle":
@@ -2248,6 +2514,39 @@ export function step(world: World): SimRequest[] {
       case "asking":
       case "considering":
         break
+      case "jailed":
+        if (world.tick >= s.until) {
+          remember(world, agent, "You were let out of the station cell this morning.")
+          log(world, `${agent.persona.name} was released from the station cell.`, [agent.id], "info")
+          becomeIdle(world, agent)
+        }
+        break
+      case "fighting": {
+        const target = agentById(world, s.targetId)
+        if (s.role === "defender") {
+          if (!isAlive(target) || target.status.kind !== "fighting" || target.status.targetId !== agent.id) becomeIdle(world, agent)
+          break
+        }
+        if (!isAlive(target) || manhattan(agent.pos, target.pos) > 2) {
+          endFight(world, agent)
+          break
+        }
+        if (!s.pending) {
+          s.pending = true
+          requests.push(
+            issue(world, {
+              kind: "press",
+              agentId: agent.id,
+              perception: perceive(world, agent),
+              targetId: target.id,
+              severity: s.severity,
+              targetHealth: target.needs.health,
+              reaction: s.reaction,
+            }),
+          )
+        }
+        break
+      }
       case "moving": {
         if (s.intent.kind === "approach") {
           const req = chase(world, agent, s, s.intent.targetId, s.intent.offer)
@@ -2581,9 +2880,176 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
       }
       break
     }
+    case "report": {
+      const crime = world.crimes.find((c) => c.id === offer.crimeId)
+      if (!crime) break
+      // Here the target is the officer and the asker is the reporter.
+      if (!target.knows.includes(crime.id)) target.knows.push(crime.id)
+      count(world, "reports")
+      if (choice === "open_case" && !caseFor(world, crime.id)) {
+        world.cases.push({ id: `case_${world.cases.length + 1}`, crimeId: crime.id, suspectId: crime.culpritId, reporterId: asker.id, openedTick: world.tick, state: "open" })
+        count(world, "cases_opened")
+        remember(world, asker, `You reported ${nameOf(world, crime.culpritId)} to ${T}, who opened a case.`)
+        remember(world, target, `${A} reported ${nameOf(world, crime.culpritId)} to you and you opened a case: ${crime.summary}`)
+        log(world, `${A} reported ${nameOf(world, crime.culpritId)} to ${T}, who opened a case.`, [asker.id, target.id, crime.culpritId], "conflict")
+      } else if (choice === "dismiss") {
+        count(world, "reports_dismissed")
+        nudgeAffinity(asker, target.id, -0.1)
+        remember(world, asker, `You reported ${nameOf(world, crime.culpritId)} to ${T}, who said it was not worth pursuing.`)
+        remember(world, target, `${A} reported ${nameOf(world, crime.culpritId)} to you and you dismissed it.`)
+        log(world, `${T} dismissed ${A}'s report about ${nameOf(world, crime.culpritId)}.`, [asker.id, target.id], "info")
+      } else {
+        remember(world, asker, `You reported ${nameOf(world, crime.culpritId)} to ${T}, who said they would look into it later.`)
+        remember(world, target, `${A} reported ${nameOf(world, crime.culpritId)} to you; you said you would look into it later.`)
+      }
+      break
+    }
+    case "arrest":
+    case "fine":
+    case "warn": {
+      // Here the target is the suspect and the asker is the officer.
+      const c = world.cases.find((x) => x.id === offer.caseId)
+      if (!c || c.state !== "open") break
+      const crime = world.crimes.find((x) => x.id === c.crimeId)
+      const victim = crime?.victimId ? agentById(world, crime.victimId) : undefined
+      asker.needs.purpose = clamp(asker.needs.purpose + 10)
+      if (offer.kind === "arrest") {
+        c.state = "arrested"
+        count(world, "arrests")
+        target.needs.respect = clamp(target.needs.respect - 30)
+        target.needCause.respect = `${A} arrested you in front of everyone`
+        const station = buildingOf(world, "police")
+        target.status = { kind: "jailed", until: nextMorning(world) }
+        enter(target, station)
+        for (const w of witnessesOf(world, asker)) remember(world, w, `You saw ${A} arrest ${T}${choice === "protest" ? ", who protested loudly" : ""}.`)
+        remember(world, target, `${A} arrested you and locked you in the station cell for the night${choice === "protest" ? "; you protested" : ""}.`)
+        remember(world, asker, `You arrested ${T} for this: ${crime?.summary ?? "a crime"}`)
+        if (victim && victim.id !== target.id) remember(world, victim, `${A} arrested ${T} for what they did to you.`)
+        log(world, `${A} arrested ${T}${choice === "protest" ? ", who protested," : ""} and locked them in the station cell.`, [asker.id, target.id], "conflict")
+        return
+      }
+      if (offer.kind === "fine") {
+        if (choice === "pay") {
+          const paid = Math.min(target.coins, offer.amount)
+          target.coins -= paid
+          if (victim && isAlive(victim)) victim.coins += paid
+          else world.town.treasury += paid
+          c.state = "fined"
+          count(world, "fines")
+          target.needs.respect = clamp(target.needs.respect - 15)
+          remember(world, target, `${A} fined you ${paid} coins for this: ${crime?.summary ?? "a crime"}`)
+          if (victim && victim.id !== target.id) remember(world, victim, `${A} fined ${T} and you received ${paid} coins.`)
+          log(world, `${A} fined ${T} ${paid} coins.`, [asker.id, target.id], "conflict")
+        } else {
+          nudgeAffinity(asker, target.id, -0.2)
+          remember(world, asker, `${T} refused to pay the fine.`)
+          remember(world, target, `You refused to pay ${A}'s fine.`)
+          log(world, `${T} refused to pay ${A}'s fine.`, [asker.id, target.id], "conflict")
+        }
+        break
+      }
+      c.state = "warned"
+      count(world, "warnings")
+      target.needs.respect = clamp(target.needs.respect - 8)
+      remember(world, target, `${A} gave you a formal warning${choice === "argue" ? "; you argued" : ""}.`)
+      log(world, `${A} gave ${T} a formal warning.`, [asker.id, target.id], "info")
+      break
+    }
+    case "attack": {
+      // Target reacts; the first blow lands; a real attack continues only if the attacker chooses to press on.
+      count(world, "assaults")
+      const seenBy = witnessesOf(world, asker).filter((w) => w.id !== target.id)
+      const health = blow(world, asker, target, offer.severity, choice)
+      recordCrime(
+        world,
+        "assault",
+        asker,
+        target,
+        `${A} ${offer.severity === "shove" ? "shoved" : "attacked"} ${T} ${describeLocation(world, asker)}.`,
+        [target, ...seenBy],
+      )
+      for (const w of seenBy) {
+        remember(world, w, `You saw ${A} ${offer.severity === "shove" ? "shove" : "attack"} ${T}${choice === "call_help" ? ", who shouted for help" : ""}.`)
+        flash(world, w, "exclaim", 5)
+      }
+      remember(world, target, `${A} ${offer.severity === "shove" ? "shoved" : "attacked"} you. You ${choice.replace(/_/g, " ")}.`)
+      remember(world, asker, `You ${offer.severity === "shove" ? "shoved" : "attacked"} ${T}.`)
+      nudgeAffinity(target, asker.id, offer.severity === "shove" ? -0.3 : -0.6)
+      wrongedBy(target, asker.id)
+      log(world, `${A} ${offer.severity === "shove" ? "shoved" : "attacked"} ${T}, who chose to ${choice.replace(/_/g, " ")}.`, [asker.id, target.id], "conflict")
+      if (health <= 0) {
+        die(world, target, `killed by ${A}`, asker)
+        return
+      }
+      if (choice === "flee") {
+        startIntent(world, target, { kind: "stock_home" })
+        remember(world, target, "You ran home.")
+        return
+      }
+      if (offer.severity !== "shove") {
+        asker.status = { kind: "fighting", role: "attacker", targetId: target.id, severity: offer.severity, reaction: choice, exchanges: 1, pending: false }
+        // Someone who fights back, pleads or takes it stays in the fight; someone shouting for help keeps moving.
+        if (choice !== "call_help") target.status = { ...asker.status, role: "defender", targetId: asker.id, pending: true }
+      }
+      break
+    }
     default:
       break
   }
+}
+
+/** Ends a fight for both sides. */
+function endFight(world: World, attacker: Agent) {
+  const s = attacker.status
+  if (s.kind !== "fighting" || s.role !== "attacker") return
+  const target = agentById(world, s.targetId)
+  becomeIdle(world, attacker)
+  if (target && target.status.kind === "fighting" && target.status.targetId === attacker.id) becomeIdle(world, target)
+}
+
+/** The attacker's answer to "do you keep attacking?". */
+function applyPress(world: World, attacker: Agent, req: Extract<SimRequest, { kind: "press" }>, ans: JevAnswer, mode: ChoiceMode) {
+  if (attacker.status.kind !== "fighting") return
+  const target = agentById(world, attacker.status.targetId)
+  const answer = ans.answers.press
+  world.stats.responses += 1
+  track(world, ans)
+  attacker.mood = readMood(ans.answers.mood) ?? attacker.mood
+  const p = answer?.type === "boolean" ? answer.probability : 0
+  const press = mode === "sample" ? nextRandom(world) < p : p >= 0.5
+  record(world, attacker, {
+    tick: world.tick,
+    kind: "respond",
+    state: ans.state,
+    options: [
+      { id: "press", label: "Keep attacking", p },
+      { id: "stop", label: "Stop", p: 1 - p },
+    ].sort((a, b) => b.p - a.p),
+    picked: press ? "press" : "stop",
+    pickedLabel: press ? "Kept attacking" : "Stopped",
+    mode,
+    latencyMs: ans.latencyMs,
+    motive: null,
+    confidence: ans.confidence.press ?? null,
+    drivers: press ? ["violence"] : [],
+  })
+  const end = () => endFight(world, attacker)
+  if (!isAlive(target) || !press) {
+    if (target) remember(world, attacker, `You stopped attacking ${target.persona.name}.`)
+    return end()
+  }
+  const { severity, reaction } = attacker.status
+  const health = blow(world, attacker, target, severity, reaction)
+  count(world, "assaults")
+  log(world, `${attacker.persona.name} kept attacking ${target.persona.name}.`, [attacker.id, target.id], "conflict")
+  if (health <= 0) {
+    die(world, target, `killed by ${attacker.persona.name}`, attacker)
+    return end()
+  }
+  attacker.status.exchanges += 1
+  attacker.status.pending = false
+  if (attacker.status.exchanges >= 4) end()
+  void req
 }
 
 function applyChatReply(world: World, target: Agent, asker: Agent | undefined, resume: Status, ans: JevAnswer, mode: ChoiceMode) {
@@ -2653,6 +3119,8 @@ export function applyAnswer(world: World, req: SimRequest, ans: JevAnswer, mode:
       return applyResponse(world, agent, req, ans, mode)
     case "reflect":
       return applyReflection(world, agent, req, ans, mode)
+    case "press":
+      return applyPress(world, agent, req, ans, mode)
   }
 }
 
@@ -2753,6 +3221,7 @@ export function failRequest(world: World, req: SimRequest, message: string) {
     return
   }
   if (req.kind === "reflect") return
+  if (req.kind === "press") return endFight(world, agent)
   if (agent.status.kind === "considering") agent.status = agent.status.resume
   const asker = agentById(world, req.askerId)
   if (asker?.status.kind === "asking") becomeIdle(world, asker, ERROR_BACKOFF_TICKS)
@@ -2765,6 +3234,25 @@ export function toWire(world: World, req: SimRequest): JevRequest {
       payload: {
         perception: req.perception,
         options: req.options.map(({ id, label, detail }) => ({ id, label, detail })),
+      },
+    }
+  }
+  if (req.kind === "press") {
+    const reactions: Record<string, string> = {
+      fight_back: `${nameOf(world, req.targetId)} is fighting back.`,
+      flee: `${nameOf(world, req.targetId)} is trying to get away.`,
+      plead: `${nameOf(world, req.targetId)} is pleading with you to stop.`,
+      call_help: `${nameOf(world, req.targetId)} is shouting for help.`,
+      take_it: `${nameOf(world, req.targetId)} is not resisting.`,
+    }
+    return {
+      kind: "press",
+      payload: {
+        perception: req.perception,
+        targetName: nameOf(world, req.targetId),
+        severity: req.severity,
+        targetHealth: Math.round(req.targetHealth),
+        reaction: reactions[req.reaction] ?? "",
       },
     }
   }

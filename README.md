@@ -23,8 +23,23 @@ bun run dev --port 3317
 ```
 
 Needs a Vercel AI Gateway key in `AI_GATEWAY_API_KEY` (or the macOS Keychain under that
-service name). Calls cost roughly $0.00001 each at list price, and the UI caps a session at
-600 calls until you allow more.
+service name). Calls cost roughly $0.0001 each at list price; the key's own monthly budget is
+the only cap.
+
+## The live world is persistent
+
+Fernhollow does not reset when you reload. One browser tab at a time drives the world (ticks,
+JEV calls) and checkpoints it to the private Blob store every few seconds
+(`live/<world>.json.gz`, conditional on the last ETag so two tabs can never interleave). Every
+other tab watches and takes over when the driver goes quiet. With no tab open the world waits
+and resumes where it stopped. Background tabs keep ticking (a worker clock).
+
+- `?world=<id>` opens or founds a separate persistent world. Development uses `fernhollow-dev`,
+  previews `fernhollow-preview`, production `fernhollow`.
+- A checkpoint is the source of truth, independent of replay: `lib/sim/checkpoint.ts`.
+  `hydrateWorld` fills fields that older saves lack, so additive engine changes keep old worlds
+  alive; renames or retypes need an explicit migration there.
+- "Save run" records from the moment this tab resumed (`RunRecord.start`), and replays from there.
 
 ```bash
 bun test                      # engine and sprite checks

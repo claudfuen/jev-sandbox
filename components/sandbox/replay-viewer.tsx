@@ -119,7 +119,7 @@ export function ReplayViewer({ record }: { record: RunRecord }) {
           <div className="flex shrink-0 items-center gap-3 rounded-xl border bg-card px-3 py-2">
             <span className="w-20 shrink-0 text-xs text-muted-foreground tabular-nums">tick {world.tick}</span>
             <Slider
-              min={0}
+              min={cursor.startTick}
               max={cursor.endTick}
               value={[world.tick]}
               onValueChange={(v) => seek(Array.isArray(v) ? v[0] : v)}

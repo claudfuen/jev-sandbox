@@ -173,9 +173,11 @@ export type DriverKey =
   | "theft"
   | "duty"
   | "confrontation"
+  | "violence"
+  | "justice"
 
 export const PROSOCIAL_DRIVERS: DriverKey[] = ["building", "providing", "generosity", "kindness", "duty"]
-export const ANTISOCIAL_DRIVERS: DriverKey[] = ["greed", "theft", "deception", "exploitation"]
+export const ANTISOCIAL_DRIVERS: DriverKey[] = ["greed", "theft", "deception", "exploitation", "violence"]
 
 /** What one villager brings to another when they walk up to them. */
 export type Offer =
@@ -189,6 +191,39 @@ export type Offer =
   | { kind: "pickpocket" }
   | { kind: "repay"; debtId: string }
   | { kind: "demand_repay"; debtId: string }
+  /** Tell the officer about a crime you know of. */
+  | { kind: "report"; crimeId: string }
+  /** The officer acting on a case. */
+  | { kind: "arrest"; caseId: string }
+  | { kind: "fine"; caseId: string; amount: number }
+  | { kind: "warn"; caseId: string }
+  /** Violence. The target sees how serious it is. */
+  | { kind: "attack"; severity: "shove" | "hurt" | "kill" }
+
+export type CrimeKind = "pickpocket" | "pantry_theft" | "assault" | "murder"
+
+/** Something wrong that happened. Only the people who saw it, suffered it or were told know of it. */
+export type Crime = {
+  id: string
+  kind: CrimeKind
+  culpritId: string
+  victimId: string | null
+  tick: number
+  place: string
+  /** One line, as a knower would describe it. */
+  summary: string
+}
+
+export type Case = {
+  id: string
+  crimeId: string
+  suspectId: string
+  reporterId: string
+  openedTick: number
+  state: "open" | "arrested" | "fined" | "warned" | "dropped"
+}
+
+export type Grave = { agentId: string; pos: Vec; tick: number; cause: string }
 
 export type Debt = {
   id: string
@@ -227,6 +262,8 @@ export type Intent =
   | { kind: "read_board" }
   | { kind: "cook_home" }
   | { kind: "stock_home" }
+  | { kind: "open_case"; crimeId: string }
+  | { kind: "drop_case"; caseId: string }
   | { kind: "eat_carry" }
   | { kind: "buy" }
   | { kind: "sell" }
@@ -245,6 +282,11 @@ export type Status =
   | { kind: "chatting"; partnerId: string; ticksLeft: number }
   | { kind: "sleeping" }
   | { kind: "collapsed"; ticksLeft: number }
+  /** Locked in the station cell until a tick. */
+  | { kind: "jailed"; until: number }
+  /** In a fight they started; each further blow waits on their own JEV decision. */
+  | { kind: "fighting"; role: "attacker" | "defender"; targetId: string; severity: "hurt" | "kill"; reaction: string; exchanges: number; pending: boolean }
+  | { kind: "dead"; tick: number; cause: string }
 
 export type ChoiceMode = "sample" | "argmax"
 
@@ -305,6 +347,10 @@ export type Agent = {
   meaning: number | null
   grudges: string[]
   gratitude: string[]
+  /** Crime ids this person knows about: seen, suffered, committed, told or read. */
+  knows: string[]
+  /** People they are grieving, by id. */
+  grieving: string[]
   status: Status
   memory: MemoryEntry[]
   affinity: Record<string, number>
@@ -375,6 +421,9 @@ export type World = {
   edition: Edition | null
   debts: Debt[]
   lies: Lie[]
+  crimes: Crime[]
+  cases: Case[]
+  graves: Grave[]
   /** Help given from one villager to another, "from>to" to count, for reciprocity. */
   favors: Record<string, number>
   agents: Agent[]

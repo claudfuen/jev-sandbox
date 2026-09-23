@@ -6,6 +6,7 @@ import {
   buildReflectState,
   buildState,
   decideQuestions,
+  pressQuestions,
   reflectQuestions,
   respondQuestions,
 } from "./prompt"
@@ -34,5 +35,10 @@ export function buildJevCall(req: JevRequest): JevCall {
       return { state: buildAssessState(req.payload), questions: assessQuestions() }
     case "reflect":
       return { state: buildReflectState(req.payload), questions: reflectQuestions(req.payload) }
+    case "press":
+      return {
+        state: buildState(req.payload.perception),
+        questions: pressQuestions(req.payload.perception, req.payload.targetName, req.payload.severity, req.payload.targetHealth, req.payload.reaction),
+      }
   }
 }

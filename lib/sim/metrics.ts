@@ -18,10 +18,13 @@ export type MetricSample = { tick: number; values: Record<string, number> }
 /** One sample per in-game hour. */
 export const METRIC_EVERY = 12
 
+/** The living. The dead stay in world.agents for history but drop out of every metric. */
+const alive = (w: World) => w.agents.filter((a) => a.status.kind !== "dead")
+
 const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0)
 
 function affinities(world: World): number[] {
-  return world.agents.flatMap((a) => world.agents.filter((b) => b.id !== a.id).map((b) => a.affinity[b.id] ?? 0))
+  return alive(world).flatMap((a) => alive(world).filter((b) => b.id !== a.id).map((b) => a.affinity[b.id] ?? 0))
 }
 
 function gini(xs: number[]): number {
@@ -43,7 +46,7 @@ function prosociality(a: World["agents"][number]): number {
 
 /** Does cooperation pay? Top-half cooperators minus bottom half, on a given outcome. */
 function cooperatorsEdge(w: World, outcome: (a: World["agents"][number]) => number): number {
-  const ranked = [...w.agents].sort((a, b) => prosociality(b) - prosociality(a))
+  const ranked = [...alive(w)].sort((a, b) => prosociality(b) - prosociality(a))
   const half = Math.floor(ranked.length / 2)
   if (!half) return 0
   return mean(ranked.slice(0, half).map(outcome)) - mean(ranked.slice(-half).map(outcome))
@@ -52,18 +55,18 @@ function cooperatorsEdge(w: World, outcome: (a: World["agents"][number]) => numb
 const wellbeingOf = (a: World["agents"][number]) => mean(NEED_KEYS.map((k) => a.needs[k]))
 
 export const METRICS: MetricDef[] = [
-  { id: "population", label: "Population", kind: "level", compute: (w) => w.agents.length },
+  { id: "population", label: "Population", kind: "level", compute: (w) => alive(w).length },
   {
     id: "wellbeing",
     label: "Wellbeing (mean need)",
     kind: "level",
-    compute: (w) => mean(w.agents.map((a) => mean(NEED_KEYS.map((k) => a.needs[k])))),
+    compute: (w) => mean(alive(w).map((a) => mean(NEED_KEYS.map((k) => a.needs[k])))),
   },
   {
     id: "distress",
     label: "Distress (mean lowest need, inverted)",
     kind: "level",
-    compute: (w) => 100 - mean(w.agents.map((a) => Math.min(...NEED_KEYS.map((k) => a.needs[k])))),
+    compute: (w) => 100 - mean(alive(w).map((a) => Math.min(...NEED_KEYS.map((k) => a.needs[k])))),
   },
   { id: "mean_affinity", label: "Mean affinity", kind: "level", compute: (w) => mean(affinities(w)) },
   {
@@ -87,9 +90,9 @@ export const METRICS: MetricDef[] = [
     },
   },
   { id: "meals", label: "Meals", kind: "count", compute: (w) => (w.counters.meals ?? 0) + (w.counters.meals_shared ?? 0) },
-  { id: "purpose", label: "Purpose (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.needs.purpose)) },
-  { id: "respect", label: "Respect (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.needs.respect)) },
-  { id: "health", label: "Health (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.needs.health)) },
+  { id: "purpose", label: "Purpose (mean)", kind: "level", compute: (w) => mean(alive(w).map((a) => a.needs.purpose)) },
+  { id: "respect", label: "Respect (mean)", kind: "level", compute: (w) => mean(alive(w).map((a) => a.needs.respect)) },
+  { id: "health", label: "Health (mean)", kind: "level", compute: (w) => mean(alive(w).map((a) => a.needs.health)) },
   { id: "pantry_food", label: "Food in the chapel pantry", kind: "level", compute: (w) => w.pantry.food },
   { id: "home_food", label: "Food in home pantries", kind: "level", compute: (w) => Object.values(w.homeFood).reduce((n, v) => n + v, 0) },
   { id: "empty_pantry", label: "Went home to an empty pantry", kind: "count", compute: (w) => w.counters.empty_pantry ?? 0 },
@@ -106,6 +109,15 @@ export const METRICS: MetricDef[] = [
     kind: "level",
     compute: (w) => ((w.counters.shift_ticks_due ?? 0) ? (w.counters.shift_ticks_worked ?? 0) / (w.counters.shift_ticks_due ?? 1) : 0),
   },
+  { id: "crimes", label: "Crimes committed", kind: "count", compute: (w) => w.crimes.length },
+  { id: "reports", label: "Crimes reported to the police", kind: "count", compute: (w) => w.counters.reports ?? 0 },
+  { id: "cases_open", label: "Open police cases", kind: "level", compute: (w) => w.cases.filter((c) => c.state === "open").length },
+  { id: "arrests", label: "Arrests", kind: "count", compute: (w) => w.counters.arrests ?? 0 },
+  { id: "fines", label: "Fines paid", kind: "count", compute: (w) => w.counters.fines ?? 0 },
+  { id: "assaults", label: "Assaults", kind: "count", compute: (w) => w.counters.assaults ?? 0 },
+  { id: "murders", label: "Murders", kind: "count", compute: (w) => w.crimes.filter((c) => c.kind === "murder").length },
+  { id: "deaths", label: "Deaths", kind: "count", compute: (w) => w.counters.deaths ?? 0 },
+  { id: "jailed", label: "In the station cell", kind: "level", compute: (w) => w.agents.filter((a) => a.status.kind === "jailed").length },
   { id: "no_shows", label: "No-shows at key jobs", kind: "count", compute: (w) => w.counters.no_shows ?? 0 },
   { id: "coasted_hours", label: "Hours coasted at work", kind: "count", compute: (w) => w.counters.coasted_hours ?? 0 },
   { id: "found_closed", label: "Found a place closed", kind: "count", compute: (w) => w.counters.found_closed ?? 0 },
@@ -145,7 +157,7 @@ export const METRICS: MetricDef[] = [
       return total ? anti / total : 0
     },
   },
-  { id: "gini_coins", label: "Wealth inequality (Gini of coins)", kind: "level", compute: (w) => gini(w.agents.map((a) => a.coins)) },
+  { id: "gini_coins", label: "Wealth inequality (Gini of coins)", kind: "level", compute: (w) => gini(alive(w).map((a) => a.coins)) },
   { id: "stall_price", label: "Grocery price", kind: "level", compute: (w) => w.shops.store.price },
   { id: "gifts", label: "Gifts given", kind: "count", compute: (w) => (w.counters.gifts ?? 0) + (w.counters.asks_helped ?? 0) },
   { id: "compliments", label: "Kind words", kind: "count", compute: (w) => w.counters.compliments ?? 0 },
@@ -160,13 +172,13 @@ export const METRICS: MetricDef[] = [
     kind: "count",
     compute: (w) => (w.counters.pickpockets_caught ?? 0) + (w.counters.pickpockets_unseen ?? 0),
   },
-  { id: "trust", label: "Trust (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.psyche.trust)) },
-  { id: "benevolence", label: "Benevolence (mean)", kind: "level", compute: (w) => mean(w.agents.map((a) => a.psyche.values.benevolence)) },
+  { id: "trust", label: "Trust (mean)", kind: "level", compute: (w) => mean(alive(w).map((a) => a.psyche.trust)) },
+  { id: "benevolence", label: "Benevolence (mean)", kind: "level", compute: (w) => mean(alive(w).map((a) => a.psyche.values.benevolence)) },
   {
     id: "machiavellianism",
     label: "Machiavellianism (mean)",
     kind: "level",
-    compute: (w) => mean(w.agents.map((a) => a.psyche.dark.machiavellianism)),
+    compute: (w) => mean(alive(w).map((a) => a.psyche.dark.machiavellianism)),
   },
   {
     id: "coop_wellbeing_edge",
@@ -179,7 +191,7 @@ export const METRICS: MetricDef[] = [
     id: "meaning",
     label: "Meaning of the day (mean)",
     kind: "level",
-    compute: (w) => mean(w.agents.filter((a) => a.meaning !== null).map((a) => a.meaning!)),
+    compute: (w) => mean(alive(w).filter((a) => a.meaning !== null).map((a) => a.meaning!)),
   },
   {
     id: "reciprocity",
@@ -187,8 +199,8 @@ export const METRICS: MetricDef[] = [
     kind: "level",
     compute: (w) => ((w.counters.helps ?? 0) ? (w.counters.favors_returned ?? 0) / (w.counters.helps ?? 1) : 0),
   },
-  { id: "grudges", label: "Grudges held", kind: "level", compute: (w) => w.agents.reduce((n, a) => n + a.grudges.length, 0) },
-  { id: "gratitude", label: "Gratitude held", kind: "level", compute: (w) => w.agents.reduce((n, a) => n + a.gratitude.length, 0) },
+  { id: "grudges", label: "Grudges held", kind: "level", compute: (w) => alive(w).reduce((n, a) => n + a.grudges.length, 0) },
+  { id: "gratitude", label: "Gratitude held", kind: "level", compute: (w) => alive(w).reduce((n, a) => n + a.gratitude.length, 0) },
   { id: "berries", label: "Berries on bushes", kind: "level", compute: (w) => w.bushes.reduce((n, b) => n + b.berries, 0) },
   { id: "calls", label: "JEV calls", kind: "count", compute: (w) => w.stats.calls },
   { id: "cost_usd", label: "Cost (USD, list)", kind: "count", compute: (w) => w.stats.costUsd },

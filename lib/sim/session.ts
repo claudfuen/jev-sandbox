@@ -61,7 +61,12 @@ export type RunRecord = {
   config: WorldConfig
   events: RunEvent[]
   metrics: MetricSample[]
+  /** A run recorded from a resumed world starts here instead of at createWorld(config). */
+  start?: { world: World; pending: SimRequest[] }
 }
+
+/** Where a resumed session begins: a checkpointed world and its in-flight requests. */
+export type SessionStart = { world: World; pending: SimRequest[]; metrics: MetricSample[] }
 
 /** A live or headless run: the world, its open JEV requests, and the recording. */
 export class Session {
@@ -69,10 +74,24 @@ export class Session {
   readonly events: RunEvent[] = []
   readonly metrics: MetricSample[] = []
   private readonly pending = new Map<number, SimRequest>()
+  /** Set when resumed from a checkpoint, so a saved run replays from that moment. */
+  private readonly start: RunRecord["start"]
 
-  constructor(readonly config: Partial<WorldConfig> = {}) {
-    this.world = createWorld(config)
-    this.metrics.push(sampleMetrics(this.world))
+  constructor(readonly config: Partial<WorldConfig> = {}, from?: SessionStart) {
+    if (from) {
+      this.world = from.world
+      for (const req of from.pending) this.pending.set(req.id, req)
+      this.metrics.push(...from.metrics)
+      this.start = { world: structuredClone(from.world), pending: structuredClone(from.pending) }
+    } else {
+      this.world = createWorld(config)
+      this.metrics.push(sampleMetrics(this.world))
+    }
+  }
+
+  /** Requests still waiting for JEV, oldest first. */
+  get inFlight(): SimRequest[] {
+    return [...this.pending.values()]
   }
 
   get openRequests(): number {
@@ -135,6 +154,7 @@ export class Session {
       config: this.world.config,
       events: this.events,
       metrics: [...this.metrics, last],
+      ...(this.start ? { start: this.start } : {}),
     }
   }
 }
@@ -160,13 +180,19 @@ export class ReplayCursor {
     return this.record.meta.endTick
   }
 
+  /** 0, or the checkpoint tick a resumed run was recorded from. */
+  get startTick(): number {
+    return this.record.start?.world.tick ?? 0
+  }
+
   get tick(): number {
     return this.world.tick
   }
 
   private reset() {
-    this.world = createWorld(this.record.config)
-    this.pending = new Map()
+    const { start } = this.record
+    this.world = start ? structuredClone(start.world) : createWorld(this.record.config)
+    this.pending = new Map(start ? structuredClone(start.pending).map((r) => [r.id, r]) : [])
     this.eventIndex = 0
     this.applyEventsAt(0)
   }
@@ -217,7 +243,7 @@ export class ReplayCursor {
   }
 
   seek(tick: number) {
-    const target = Math.max(0, Math.min(this.endTick, Math.round(tick)))
+    const target = Math.max(this.startTick, Math.min(this.endTick, Math.round(tick)))
     if (target < this.world.tick) {
       let best: number | null = null
       for (const t of this.keyframes.keys()) if (t <= target && (best === null || t > best)) best = t

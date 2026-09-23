@@ -1,8 +1,8 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Link from "next/link"
-import { ChevronDown, Download, Film, Pause, Play, RotateCcw } from "lucide-react"
+import { ChevronDown, Download, Eye, Film, Pause, Play, RotateCcw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
@@ -12,10 +12,39 @@ import type { ChoiceMode } from "@/lib/sim/types"
 
 import { InspectorPanel, VillageLog } from "./inspector"
 import { MetricsPanel } from "./metric-strip"
-import { CALL_BUDGET_STEP, useSandbox, type Speed } from "./use-sandbox"
+import { useSandbox, type LiveRole, type SaveState, type Speed } from "./use-sandbox"
 import { WorldCanvas } from "./world-canvas"
 
 const TICKS_PER_DAY = 288
+
+function LiveBadge({ role, saved }: { role: LiveRole; saved: SaveState }) {
+  const [, force] = useState(0)
+  // Re-render every few seconds so "saved 12s ago" stays true.
+  useEffect(() => {
+    const id = setInterval(() => force((n) => n + 1), 5000)
+    return () => clearInterval(id)
+  }, [])
+  const ago = saved.at === null ? null : Math.max(0, Math.round((Date.now() - saved.at) / 1000))
+  const text =
+    role === "loading"
+      ? "Opening Fernhollow..."
+      : role === "spectator"
+        ? "Watching: another tab is running this world"
+        : role === "local"
+          ? "Offline: this world is not saved"
+          : saved.error
+            ? `Live, last save failed (${saved.error})`
+            : ago === null
+              ? "Live"
+              : `Live, saved ${ago < 5 ? "just now" : `${ago}s ago`}`
+  const tone = role === "driver" && !saved.error ? "bg-emerald-500" : role === "spectator" ? "bg-sky-500" : "bg-amber-500"
+  return (
+    <span className="flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs text-muted-foreground">
+      <span className={`size-1.5 rounded-full ${tone} ${role === "driver" ? "animate-pulse" : ""}`} />
+      {text}
+    </span>
+  )
+}
 
 function downloadJson(filename: string, data: unknown) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: "application/json" }))
@@ -42,16 +71,22 @@ export function Sandbox() {
         <span className="rounded-md bg-muted px-2 py-0.5 text-xs font-medium tabular-nums first-letter:uppercase">
           {formatClock(world.tick)}
         </span>
+        <LiveBadge role={sim.role} saved={sim.saved} />
         <div className="hidden flex-wrap items-center gap-x-4 text-xs text-muted-foreground tabular-nums md:flex">
-          <span>
-            {stats.calls}/{sim.budget} JEV calls
-          </span>
+          <span>{stats.calls.toLocaleString()} JEV calls</span>
           <span>{avgLatency === null ? "no answers yet" : `${avgLatency} ms avg`}</span>
-          <span>${stats.costUsd.toFixed(4)} list price</span>
+          <span>${stats.costUsd.toFixed(2)} spent on this world</span>
           {stats.errors > 0 && <span className="text-destructive">{stats.errors} errors</span>}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          {sim.role === "spectator" && (
+            <Button size="sm" onClick={sim.takeOver}>
+              <Eye />
+              Run it here
+            </Button>
+          )}
           <Button
+            disabled={sim.role === "spectator" || sim.role === "loading"}
             variant={sim.running ? "outline" : "default"}
             size="sm"
             onClick={() => sim.setRunning(!sim.running)}
@@ -84,7 +119,7 @@ export function Sandbox() {
             <ToggleGroupItem value="argmax">Top pick</ToggleGroupItem>
           </ToggleGroup>
           <DropdownMenu>
-            <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}>
+            <DropdownMenuTrigger render={<Button variant="outline" size="sm" disabled={sim.role === "spectator" || sim.role === "loading"} />}>
               Intervene
               <ChevronDown />
             </DropdownMenuTrigger>
@@ -93,7 +128,7 @@ export function Sandbox() {
               <DropdownMenuItem onClick={() => sim.intervene({ kind: "bounty" })}>Bounty: refill every bush</DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          <Button variant="ghost" size="sm" onClick={sim.reset}>
+          <Button variant="ghost" size="sm" onClick={sim.reset} disabled={sim.role === "spectator" || sim.role === "loading"}>
             <RotateCcw />
             New world
           </Button>
@@ -120,15 +155,6 @@ export function Sandbox() {
           <div className="relative aspect-[8/5] w-full rounded-xl bg-neutral-900 lg:aspect-auto lg:min-h-0 lg:flex-1">
             <WorldCanvas worldRef={sim.worldRef} alphaRef={sim.alphaRef} selectedId={selected.id} onSelect={setSelectedId} />
           </div>
-
-          {sim.budgetHit && (
-            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
-              <span>The call budget is spent, so nobody can make new decisions. Characters finish what they are doing and wait.</span>
-              <Button size="sm" onClick={sim.extendBudget}>
-                Allow {CALL_BUDGET_STEP} more calls
-              </Button>
-            </div>
-          )}
 
           <div className="grid shrink-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
             <VillageLog world={world} />

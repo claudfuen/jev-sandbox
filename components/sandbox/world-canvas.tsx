@@ -243,17 +243,20 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
     const ctx = canvas.getContext("2d")!
     let staticLayer: HTMLCanvasElement | null = null
     let staticFor: World | null = null
+    let staticGraves = -1
     let raf = 0
 
     const frame = (t: number) => {
       const world = worldRef.current
-      if (world !== staticFor) {
+      // Graves are the only tiles that change after a world is created.
+      if (world !== staticFor || world.graves.length !== staticGraves) {
         staticLayer = paintStatic(world)
         staticFor = world
+        staticGraves = world.graves.length
       }
       const alpha = Math.max(0, Math.min(1, alphaRef.current))
       const drawn = world.agents
-        .filter((a) => !a.inside)
+        .filter((a) => !a.inside && a.status.kind !== "dead")
         .map((a) => {
           const moving = a.prev.x !== a.pos.x || a.prev.y !== a.pos.y
           const x = (a.prev.x + (a.pos.x - a.prev.x) * alpha) * TILE
@@ -428,7 +431,7 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
     const { x: wx, y: wy } = worldPoint(event)
     let best: { id: string; d: number } | null = null
     for (const a of worldRef.current.agents) {
-      if (a.inside) continue
+      if (a.inside || a.status.kind === "dead") continue
       const d = Math.hypot(a.pos.x + 0.5 - wx, a.pos.y + 0.3 - wy)
       if (d < 1.4 && (!best || d < best.d)) best = { id: a.id, d }
     }

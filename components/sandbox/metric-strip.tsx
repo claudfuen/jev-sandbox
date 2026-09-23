@@ -37,6 +37,11 @@ export const DEFAULT_STRIPS: StripSpec[] = [
   { id: "grudges", label: "Grudges held", format: whole },
   { id: "stall_price", label: "Grocery price", format: whole },
   { id: "attendance", label: "Shift attendance", format: pct },
+  { id: "population", label: "Alive", format: whole },
+  { id: "crimes", label: "Crimes", format: whole },
+  { id: "arrests", label: "Arrests", format: whole },
+  { id: "assaults", label: "Assaults", format: whole },
+  { id: "deaths", label: "Deaths", format: whole },
   { id: "treasury", label: "Town treasury", format: whole },
   { id: "bridge", label: "Footbridge built", format: pct },
 ]

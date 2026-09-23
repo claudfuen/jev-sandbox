@@ -77,6 +77,11 @@ export const offerWireSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ask_food") }),
   z.object({ kind: z.literal("lend"), amount: z.number().int().min(1).max(50), owed: z.number().int().min(1).max(100) }),
   z.object({ kind: z.literal("demand_repay"), owed: z.number().int().min(1).max(100) }),
+  z.object({ kind: z.literal("report"), accused: z.string().max(40), crime: z.string().max(300) }),
+  z.object({ kind: z.literal("arrest"), crime: z.string().max(300) }),
+  z.object({ kind: z.literal("fine"), amount: z.number().int().min(1).max(200), crime: z.string().max(300), victim: z.string().max(40) }),
+  z.object({ kind: z.literal("warn"), crime: z.string().max(300) }),
+  z.object({ kind: z.literal("attack"), severity: z.enum(["shove", "hurt", "kill"]) }),
 ])
 export type OfferWire = z.infer<typeof offerWireSchema>
 
@@ -163,6 +168,10 @@ export const jevRequestSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("respond"), payload: respondPayloadSchema }),
   z.object({ kind: z.literal("assess"), payload: assessPayloadSchema }),
   z.object({ kind: z.literal("reflect"), payload: reflectPayloadSchema }),
+  z.object({
+    kind: z.literal("press"),
+    payload: z.object({ perception: perceptionSchema, targetName: z.string().max(40), severity: z.enum(["hurt", "kill"]), targetHealth: z.number().min(0).max(100), reaction: z.string().max(200) }),
+  }),
 ])
 
 export type Needs = z.infer<typeof needsSchema>

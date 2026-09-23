@@ -8,6 +8,8 @@ import { ReplayCursor, Session } from "@/lib/sim/session"
 import { jevRequestSchema, type JevAnswer } from "@/lib/jev/schema"
 import { replyCriteria } from "@/lib/jev/prompt"
 import { toWire } from "@/lib/sim/engine"
+import { fakeAnswer } from "./fake-jev"
+import { hydrateWorld, isCheckpoint, makeCheckpoint, type Checkpoint } from "@/lib/sim/checkpoint"
 
 describe("pixel maps", () => {
   for (const [name, { map, width }] of Object.entries(PIXEL_MAPS)) {
@@ -66,43 +68,6 @@ describe("world", () => {
     }
   })
 })
-
-// A deterministic stand-in for JEV so the replay test needs no network.
-function fakeAnswer(req: SimRequest): JevAnswer {
-  const h = (n: number) => ((req.id * 2654435761 + n * 97) >>> 0) / 4294967296
-  const mood = { type: "score" as const, score: Math.floor(h(1) * 5), probabilities: { "0": 0.1, "1": 0.2, "2": 0.4, "3": 0.2, "4": 0.1 } }
-  if (req.kind === "decide") {
-    const weights = req.options.map((_, i) => h(i + 2) + 0.05)
-    const total = weights.reduce((a, b) => a + b, 0)
-    const probabilities = Object.fromEntries(req.options.map((o, i) => [o.id, weights[i] / total]))
-    const choice = req.options[weights.indexOf(Math.max(...weights))].id
-    const motive = { type: "choice" as const, choice: "purpose", probabilities: { purpose: 0.6, gain: 0.4 } }
-    return { kind: "decide", state: "", answers: { action: { type: "choice", choice, probabilities }, mood, motive }, confidence: { action: 0.5 }, latencyMs: 300, costUsd: 0.00002 }
-  }
-  if (req.kind === "reflect") {
-    const score = (n: number) => ({ type: "score" as const, score: n, probabilities: { [String(n)]: 1 } })
-    const pickOf = (ids: string[]) => ids[Math.floor(h(5) * ids.length)]
-    const one = (id: string) => ({ type: "choice" as const, choice: id, probabilities: { [id]: 1 } })
-    const answers: JevAnswer["answers"] = {
-      meaning: score(Math.floor(h(6) * 5)),
-      trust_people: score(Math.floor(h(7) * 5)),
-      change: one(pickOf(["unchanged", "more_wary", "more_generous", "more_ruthless", "more_content"])),
-      mood,
-    }
-    if (req.today.length) answers.keep = one(`m${Math.floor(h(8) * req.today.length)}`)
-    if (req.helpers.length) answers.grateful_to = one(req.helpers[0][0])
-    if (req.wrongers.length) answers.grudge = one(req.wrongers[0][0])
-    if (req.askGoal) answers.goal = one(pickOf(["build", "wealth", "family", "revenge"]))
-    return { kind: "reflect", state: "", answers, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
-  }
-  if (req.wire.kind === "chat") {
-    return { kind: "respond", state: "", answers: { engage: { type: "boolean", probability: h(3) }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
-  }
-  const ids = Object.keys(replyCriteria(req.wire, req.can, "them"))
-  const choice = ids[Math.floor(h(4) * ids.length)]
-  const probabilities = Object.fromEntries(ids.map((id) => [id, id === choice ? 0.7 : 0.3 / Math.max(1, ids.length - 1)]))
-  return { kind: "respond", state: "", answers: { reply: { type: "choice", choice, probabilities }, mood }, confidence: {}, latencyMs: 300, costUsd: 0.00002 }
-}
 
 describe("record and replay", () => {
   test("a recorded run replays to the identical world, including after seeking back", () => {
@@ -240,13 +205,107 @@ describe("reflection", () => {
 
 describe("town", () => {
   test("shops open only while their keeper is inside on shift, and payroll follows hours worked", () => {
-    const session = new Session({ seed: 31 })
-    for (let t = 0; t < 300; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
-    const c = session.world.counters
+    // Random stand-in answers are spread thin over a large menu, so pool a few towns.
+    const c: Record<string, number> = {}
+    for (const seed of [31, 32, 33]) {
+      const session = new Session({ seed })
+      for (let t = 0; t < 300; t++) for (const req of session.tick()) session.answer(req.id, fakeAnswer(req), "sample")
+      for (const [k, v] of Object.entries(session.world.counters)) c[k] = (c[k] ?? 0) + v
+    }
     expect(c.work_sessions ?? 0).toBeGreaterThan(0)
     // Nobody was ever served while the keeper was away.
     expect((c.meals_served ?? 0) + (c.drinks_served ?? 0) + (c.purchases ?? 0) + (c.found_closed ?? 0)).toBeGreaterThan(0)
     expect((c.shift_ticks_due ?? 0) > 0).toBe(true)
     expect(c.coins_in ?? 0).toBeGreaterThan(0)
+  })
+})
+
+describe("justice", () => {
+  test("the dead never act again, every murder leaves a grave, and the cell always unlocks", () => {
+    let deaths = 0
+    for (const seed of [5, 6]) {
+      const session = new Session({ seed })
+      const jailedSince = new Map<string, number>()
+      for (let t = 0; t < 1500; t++) {
+        for (const req of session.tick()) {
+          const agent = session.world.agents.find((a) => a.id === req.agentId)!
+          expect(agent.status.kind).not.toBe("dead")
+          session.answer(req.id, fakeAnswer(req), "sample")
+        }
+        for (const a of session.world.agents) {
+          if (a.status.kind === "jailed") {
+            if (!jailedSince.has(a.id)) jailedSince.set(a.id, session.world.tick)
+            // Never held longer than a full day.
+            expect(session.world.tick - jailedSince.get(a.id)!).toBeLessThanOrEqual(288)
+          } else jailedSince.delete(a.id)
+        }
+      }
+      const w = session.world
+      const dead = w.agents.filter((a) => a.status.kind === "dead")
+      deaths += dead.length
+      expect(w.graves.length).toBe(dead.length)
+      for (const m of w.crimes.filter((c) => c.kind === "murder")) expect(w.graves.some((g) => g.agentId === m.victimId)).toBe(true)
+      for (const a of dead) {
+        const died = a.status.kind === "dead" ? a.status.tick : 0
+        expect(a.decisions.every((d) => d.tick <= died)).toBe(true)
+      }
+    }
+    // Random stand-in answers are violent; this proves the path is exercised.
+    expect(deaths).toBeGreaterThan(0)
+  })
+})
+
+describe("live checkpoints", () => {
+  const strip = (w: unknown) =>
+    JSON.parse(JSON.stringify(w, (k, v) => (k === "state" && typeof v === "string" ? "" : v)))
+
+  test("a world resumed from a checkpoint continues exactly as if it never stopped", () => {
+    // Answers arrive one tick late, so requests are in flight at the checkpoint.
+    const run = (session: Session, from: number, to: number, carry: SimRequest[]) => {
+      let lagged = carry
+      for (let t = from; t < to; t++) {
+        const fresh = session.tick()
+        for (const req of lagged) session.answer(req.id, fakeAnswer(req), "sample")
+        lagged = fresh
+      }
+      return lagged
+    }
+    const a = new Session({ seed: 77 })
+    let inFlight = run(a, 0, 150, [])
+    let at = 150
+    while (inFlight.length === 0) inFlight = run(a, at, ++at, inFlight)
+    const cp = makeCheckpoint("test", a.world, a.inFlight, a.metrics, { speed: 1, mode: "sample", running: true })
+    expect(a.inFlight.length).toBeGreaterThan(0)
+    const restored = JSON.parse(JSON.stringify(cp)) as Checkpoint
+    expect(isCheckpoint(restored)).toBe(true)
+    const world = hydrateWorld(restored.world)
+    const b = new Session(world.config, { world, pending: restored.pending, metrics: restored.metrics })
+    expect(b.inFlight.map((r) => r.id)).toEqual(inFlight.map((r) => r.id))
+    run(a, at, 400, inFlight)
+    run(b, at, 400, b.inFlight)
+    expect(strip(b.world)).toEqual(strip(a.world))
+  })
+
+  test("hydration fills fields that older saves lack", () => {
+    const s = new Session({ seed: 78 })
+    const old = JSON.parse(JSON.stringify(s.world))
+    delete old.graves
+    delete old.agents[0].grieving
+    const w = hydrateWorld(old)
+    expect(w.graves).toEqual([])
+    expect(w.agents[0].grieving).toEqual([])
+  })
+
+  test("a saved run from a resumed world replays from its checkpoint", () => {
+    const a = new Session({ seed: 79 })
+    for (let t = 0; t < 100; t++) for (const req of a.tick()) a.answer(req.id, fakeAnswer(req), "sample")
+    const world = hydrateWorld(JSON.parse(JSON.stringify(a.world)))
+    const b = new Session(world.config, { world, pending: [], metrics: [] })
+    for (let t = 0; t < 120; t++) for (const req of b.tick()) b.answer(req.id, fakeAnswer(req), "sample")
+    const record = JSON.parse(JSON.stringify(b.toRecord({ id: "resumed", title: "t", createdAt: "", source: "live" })))
+    const cursor = new ReplayCursor(record)
+    cursor.seek(record.meta.endTick)
+    expect(cursor.desyncs).toBe(0)
+    expect(strip(cursor.world)).toEqual(strip(b.world))
   })
 })

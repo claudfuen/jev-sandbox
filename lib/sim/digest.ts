@@ -22,6 +22,7 @@ export function digestRun(world: World, title: string): { title: string; summary
     `Rule breaking: ${n("thefts_seen")} witnessed and ${n("thefts_unseen")} unwitnessed takings from the pantry without need.`,
     `Economy: ${n("purchases")} grocery purchases and ${n("sales")} sales to the store (grocery price now ${world.shops.store.price}); ${n("gifts") + n("asks_helped")} gifts; ${n("compliments")} kind words; ${n("loans")} loans (${n("loans_usurious")} at a steep rate, ${n("loans_repaid")} repaid, ${n("loans_defaulted")} defaulted).`,
     `Deception and theft: ${n("lies_told")} lies told, ${n("lies_caught")} caught; ${n("pickpockets_caught")} pockets picked in sight, ${n("pickpockets_unseen")} unseen.`,
+    `Conflict and justice: ${world.crimes.length} crimes on record, ${n("reports")} reports to the police, ${n("cases_opened")} cases opened and ${n("cases_dropped")} dropped, ${n("arrests")} arrests, ${n("fines")} fines, ${n("warnings")} warnings; ${n("assaults")} assaults; ${n("deaths")} deaths (${world.crimes.filter((x) => x.kind === "murder").length} murders).`,
     `Inner lives: ${n("reflections")} nightly reflections; ${n("grudges")} grudges formed and ${n("gratitude")} debts of gratitude; favours returned ${n("favors_returned")} of ${n("helps")} helps; personalities drift by ${world.config.driftModel === "jev" ? "their own reflection" : world.config.driftModel === "engine" ? "engine habit rules" : "nothing (fixed)"}.`,
   ]
   const notable = world.log.filter((l) => l.tone !== "info" && l.tone !== "error")

@@ -156,6 +156,36 @@ export function replyCriteria(offer: OfferWire, can: { food: number; coins: numb
       c.refuse = "Refuse to pay"
       return c
     }
+    case "report":
+      return {
+        open_case: `Open a case against ${offer.accused} and look into it`,
+        later: "Say you will look into it later, and do nothing for now",
+        dismiss: `Tell ${askerName} it is not worth pursuing`,
+      }
+    case "arrest":
+      return {
+        go_quietly: "Go quietly to the cell for the night",
+        protest: "Protest loudly that it is unfair, but go",
+      }
+    case "fine": {
+      const c: Record<string, string> = {}
+      if (can.coins >= 1) c.pay = `Pay the fine (up to ${offer.amount} coins, to ${offer.victim})`
+      c.refuse = "Refuse to pay"
+      return c
+    }
+    case "warn":
+      return {
+        accept: "Take the warning and say it will not happen again",
+        argue: "Argue that you did nothing wrong",
+      }
+    case "attack":
+      return {
+        fight_back: `Fight back against ${askerName}`,
+        flee: "Run away",
+        plead: `Plead with ${askerName} to stop`,
+        call_help: "Shout for help",
+        take_it: "Take it without resisting",
+      }
   }
 }
 
@@ -173,6 +203,20 @@ function offerSentence(offer: OfferWire, askerName: string): string {
       return `${askerName} just walked up and offers to lend you ${offer.amount} coins, to be paid back as ${offer.owed} coins by tomorrow evening.`
     case "demand_repay":
       return `${askerName} just walked up and, in front of anyone nearby, demands the ${offer.owed} coins you owe them.`
+    case "report":
+      return `${askerName} comes to you as the police officer to report something: ${offer.crime} They say ${offer.accused} did it.`
+    case "arrest":
+      return `${askerName}, the police officer, has come to arrest you for this: ${offer.crime} You would spend tonight in the station cell.`
+    case "fine":
+      return `${askerName}, the police officer, fines you ${offer.amount} coins, to be paid to ${offer.victim}, for this: ${offer.crime}`
+    case "warn":
+      return `${askerName}, the police officer, gives you a formal warning about this: ${offer.crime}`
+    case "attack":
+      return offer.severity === "shove"
+        ? `${askerName} suddenly shoves you hard, angry.`
+        : offer.severity === "hurt"
+          ? `${askerName} attacks you, clearly meaning to hurt you.`
+          : `${askerName} attacks you with murderous intent. They are trying to kill you.`
   }
 }
 
@@ -332,4 +376,17 @@ export function reflectQuestions(p: ReflectPayload): Record<string, EvaluationQu
     }
   }
   return q
+}
+
+// ---------------------------------------------------------------------------
+// Violence: every further blow is its own decision by the attacker.
+
+export function pressQuestions(p: Perception, targetName: string, severity: "hurt" | "kill", targetHealth: number, reaction: string): Record<string, EvaluationQuestion> {
+  return {
+    press: {
+      type: "boolean",
+      instructions: `${p.name} is attacking ${targetName}${severity === "kill" ? " meaning to kill them" : " meaning to hurt them"}. ${reaction} ${targetName} looks ${targetHealth < 30 ? "badly hurt" : targetHealth < 60 ? "hurt" : "shaken but standing"}. Does ${p.name} keep attacking?`,
+    },
+    mood: moodQuestion(p.name),
+  }
 }

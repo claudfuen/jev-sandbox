@@ -44,6 +44,35 @@ const SCALE = 1
 const W = MAP_W * TILE
 const H = MAP_H * TILE
 
+/**
+ * Buildings and bushes change only when someone enters or leaves, berries grow, or
+ * night deepens a step, yet they are most of the drawing. Paint them into a layer
+ * and redraw that layer only when its key changes.
+ */
+function paintProps(world: World, night: number): HTMLCanvasElement {
+  const canvas = document.createElement("canvas")
+  canvas.width = W * SCALE
+  canvas.height = H * SCALE
+  const ctx = canvas.getContext("2d")!
+  ctx.imageSmoothingEnabled = false
+  ctx.scale(SCALE, SCALE)
+  for (const bush of world.bushes) {
+    drawGrass(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.pos.x, bush.pos.y)
+    drawBush(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.berries)
+  }
+  for (const b of world.buildings) drawBuilding(ctx, b, world.agents.some((a) => a.insideOf === b.id), night)
+  return canvas
+}
+
+function propsKey(world: World, night: number): string {
+  const lit = world.buildings.map((b) => (world.agents.some((a) => a.insideOf === b.id) ? "1" : "0")).join("")
+  return `${lit}|${world.bushes.map((b) => b.berries).join(",")}|${night.toFixed(2)}`
+}
+
+/** Frames per second while villagers move, and while the world is still (paused, watching, or between ticks). */
+const FPS_MOVING = 30
+const FPS_STILL = 8
+
 /** Everything that never changes, painted once. Animated tiles and buildings are drawn per frame. */
 function paintStatic(world: World): HTMLCanvasElement {
   const canvas = document.createElement("canvas")
@@ -215,10 +244,13 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
   const selectedRef = useRef(selectedId)
   selectedRef.current = selectedId
   const camRef = useRef<Camera>({ zoom: 1, cx: W / 2, cy: H / 2, follow: false })
+  /** Until when the camera is being moved by hand, which needs full frame rate. */
+  const interactRef = useRef(0)
   const [cam, setCam] = useState<Camera>(camRef.current)
   const dragRef = useRef<{ x: number; y: number; moved: boolean } | null>(null)
 
   const updateCam = (next: Partial<Camera>) => {
+    interactRef.current = performance.now() + 400
     camRef.current = { ...camRef.current, ...next }
     setCam(camRef.current)
   }
@@ -244,15 +276,31 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
     let staticLayer: HTMLCanvasElement | null = null
     let staticFor: World | null = null
     let staticGraves = -1
+    let animated: { tx: number; ty: number }[] = []
+    let props: HTMLCanvasElement | null = null
+    let propsFor = ""
     let raf = 0
+    let lastDraw = -Infinity
 
     const frame = (t: number) => {
+      raf = requestAnimationFrame(frame)
+      const still = alphaRef.current >= 1 && !camRef.current.follow && t > interactRef.current
+      if (t - lastDraw < 1000 / (still ? FPS_STILL : FPS_MOVING) - 1) return
+      lastDraw = t
       const world = worldRef.current
       // Graves are the only tiles that change after a world is created.
       if (world !== staticFor || world.graves.length !== staticGraves) {
         staticLayer = paintStatic(world)
         staticFor = world
         staticGraves = world.graves.length
+        animated = []
+        for (let ty = 0; ty < MAP_H; ty++) {
+          for (let tx = 0; tx < MAP_W; tx++) {
+            const tile = tileAt(world.tiles, tx, ty)
+            if (["water", "fountain", "ford", "bridge_lot", "scaffold", "bridge"].includes(tile)) animated.push({ tx, ty })
+          }
+        }
+        propsFor = ""
       }
       const alpha = Math.max(0, Math.min(1, alphaRef.current))
       const drawn = world.agents
@@ -283,8 +331,8 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
 
       // Animated tiles and the footbridge.
       const progress = world.project.sessionsDone / world.project.sessionsNeeded
-      for (let ty = 0; ty < MAP_H; ty++) {
-        for (let tx = 0; tx < MAP_W; tx++) {
+      for (const { tx, ty } of animated) {
+        {
           const tile = tileAt(world.tiles, tx, ty)
           const px = tx * TILE
           const py = ty * TILE
@@ -304,16 +352,15 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
           }
         }
       }
-      for (const bush of world.bushes) {
-        drawGrass(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.pos.x, bush.pos.y)
-        drawBush(ctx, bush.pos.x * TILE, bush.pos.y * TILE, bush.berries)
-      }
-
       const night = darkness(world.tick)
-      for (const b of world.buildings) {
-        const lit = world.agents.some((a) => a.insideOf === b.id)
-        drawBuilding(ctx, b, lit, night)
+      // Night in steps of 0.02 is invisible to the eye and keeps the props layer cached.
+      const nightStep = Math.round(night * 50) / 50
+      const key = propsKey(world, nightStep)
+      if (key !== propsFor || !props) {
+        props = paintProps(world, nightStep)
+        propsFor = key
       }
+      ctx.drawImage(props, 0, 0, W, H)
 
       for (const { a, x, y, moving } of drawn) {
         if (a.id === selectedRef.current) {
@@ -359,13 +406,12 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
         ctx.fillStyle = selected ? PAL.outline : PAL.white
         ctx.fillText(label, lx + 3 * px, y + 16.5 + 1.5 * px)
       }
-
-      raf = requestAnimationFrame(frame)
     }
     raf = requestAnimationFrame(frame)
 
     const onWheel = (event: WheelEvent) => {
       event.preventDefault()
+      interactRef.current = performance.now() + 400
       const rect = canvas.getBoundingClientRect()
       const before = view(canvas)
       const mx = (event.clientX - rect.left) * dpr
@@ -416,6 +462,7 @@ export function WorldCanvas({ worldRef, alphaRef, selectedId, onSelect }: Props)
     const rect = canvas.getBoundingClientRect()
     const { k, cx, cy } = view(canvas)
     const dpr = canvas.width / rect.width
+    interactRef.current = performance.now() + 400
     camRef.current = { ...camRef.current, follow: false, cx: cx - (dx * dpr) / k, cy: cy - (dy * dpr) / k }
     drag.x = event.clientX
     drag.y = event.clientY

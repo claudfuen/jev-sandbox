@@ -340,6 +340,8 @@ export type Agent = {
   lastReflectDay: number
   /** Tick of the last nightly reflection, so each sleep reflects at most once. */
   lastReflectTick: number
+  /** Draws made from this villager's own random stream. */
+  rolls: number
   /** Who helped and who wronged them today, for tonight's reflection. */
   today: { day: number; helpers: string[]; wrongers: string[] }
   /** Moments JEV said they will carry for years. */

@@ -120,10 +120,15 @@ const HEALTH_LOSS = 0.35
 // ---------------------------------------------------------------------------
 // Setup
 
-function nextRandom(world: World): number {
-  // mulberry32
-  world.rng = (world.rng + 0x6d2b79f5) | 0
-  let t = world.rng
+/**
+ * Each villager draws from their own seeded stream, keyed by how many draws they
+ * have made. One late answer then cannot reshuffle everyone else's luck.
+ */
+function rollFor(world: World, agent: Agent): number {
+  agent.rolls += 1
+  let h = (world.config.seed ^ Math.imul(agent.rolls, 0x9e3779b1)) | 0
+  for (let i = 0; i < agent.id.length; i++) h = Math.imul(h ^ agent.id.charCodeAt(i), 0x01000193)
+  let t = (h + 0x6d2b79f5) | 0
   t = Math.imul(t ^ (t >>> 15), t | 1)
   t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296
@@ -169,6 +174,7 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
       psycheAtBirth: structuredClone(persona.psyche),
       lastReflectDay: 0,
       lastReflectTick: -REFLECT_GAP_TICKS,
+      rolls: 0,
       today: { day: 1, helpers: [], wrongers: [] },
       formative: [],
       goal: null,
@@ -1493,7 +1499,7 @@ export function buildOptions(world: World, agent: Agent): OptionSpec[] {
     if (field[i] >= 3 && field[i] <= 8) nearby.push({ x: i % MAP_W, y: Math.floor(i / MAP_W) })
   }
   if (nearby.length) {
-    const target = nearby[Math.floor(nextRandom(world) * nearby.length)]
+    const target = nearby[Math.floor(rollFor(world, agent) * nearby.length)]
     add({
       id: "wander",
       label: "Wander around nearby",
@@ -2642,13 +2648,13 @@ export function step(world: World): SimRequest[] {
 /** Options less likely than this fraction of JEV's favourite are never sampled (min-p). */
 const MIN_P = 0.25
 
-function pickFrom(world: World, probabilities: Record<string, number>, fallback: string, mode: ChoiceMode): string {
+function pickFrom(world: World, agent: Agent, probabilities: Record<string, number>, fallback: string, mode: ChoiceMode): string {
   if (mode === "argmax") return fallback
   const top = Math.max(0, ...Object.values(probabilities))
   const entries = Object.entries(probabilities).filter(([, p]) => p > 0 && p >= top * MIN_P)
   const total = entries.reduce((sum, [, p]) => sum + p, 0)
   if (total <= 0) return fallback
-  let roll = nextRandom(world) * total
+  let roll = rollFor(world, agent) * total
   for (const [id, p] of entries) {
     roll -= p
     if (roll <= 0) return id
@@ -2704,7 +2710,7 @@ function applyDecision(world: World, agent: Agent, ans: JevAnswer, mode: ChoiceM
   agent.mood = readMood(ans.answers.mood)
 
   const known = Object.fromEntries(options.map((o) => [o.id, action.probabilities[o.id] ?? 0]))
-  const pickedId = pickFrom(world, known, action.choice, mode)
+  const pickedId = pickFrom(world, agent, known, action.choice, mode)
   const picked = options.find((o) => o.id === pickedId) ?? options.find((o) => o.id === action.choice)
   if (!picked) return answerError(world, agent, `unknown option ${action.choice}`)
 
@@ -2750,7 +2756,7 @@ function applyResponse(world: World, target: Agent, req: Extract<SimRequest, { k
   track(world, ans)
   target.mood = readMood(ans.answers.mood)
   const known = Object.fromEntries(Object.keys(criteria).map((id) => [id, reply.probabilities[id] ?? 0]))
-  const choice = pickFrom(world, known, criteria[reply.choice] ? reply.choice : Object.keys(criteria)[0], mode)
+  const choice = pickFrom(world, target, known, criteria[reply.choice] ? reply.choice : Object.keys(criteria)[0], mode)
   record(world, target, {
     tick: world.tick,
     kind: "respond",
@@ -3043,7 +3049,7 @@ function applyPress(world: World, attacker: Agent, req: Extract<SimRequest, { ki
   track(world, ans)
   attacker.mood = readMood(ans.answers.mood) ?? attacker.mood
   const p = answer?.type === "boolean" ? answer.probability : 0
-  const press = mode === "sample" ? nextRandom(world) < p : p >= 0.5
+  const press = mode === "sample" ? rollFor(world, attacker) < p : p >= 0.5
   record(world, attacker, {
     tick: world.tick,
     kind: "respond",
@@ -3092,7 +3098,7 @@ function applyChatReply(world: World, target: Agent, asker: Agent | undefined, r
   target.mood = readMood(ans.answers.mood)
 
   const p = engageAnswer.probability
-  const engage = mode === "sample" ? nextRandom(world) < p : p >= 0.5
+  const engage = mode === "sample" ? rollFor(world, target) < p : p >= 0.5
   record(world, target, {
     tick: world.tick,
     kind: "respond",
@@ -3179,7 +3185,7 @@ function applyReflection(world: World, agent: Agent, req: Extract<SimRequest, { 
   const choice = (q: string, fallback: string) => {
     const a = ans.answers[q]
     if (!a || a.type !== "choice") return fallback
-    return pickFrom(world, a.probabilities, a.choice, mode)
+    return pickFrom(world, agent, a.probabilities, a.choice, mode)
   }
   const change = choice("change", "unchanged")
   reflectDrift(world, agent, change, scoreEv(ans.answers.trust_people) ?? 2)

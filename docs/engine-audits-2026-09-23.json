@@ -1,0 +1,1080 @@
+[
+ {
+  "lens": "World model and affordances: entities, items, ownership, construction and destruction, and how options are enumerated for JEV",
+  "summary": "Fernhollow has no world model that villagers can change. The world is a hand-laid, fixed tile grid (town-map.ts:3 says \"Hand-laid and fixed\"), 21 fixed buildings with no owner, durability or contents, and a set of one-off containers: one footbridge project, one chapel pantry, a homeFood map, and three shops keyed by a closed \"store\"|\"diner\"|\"inn\" union. Items are a single undifferentiated \"food\" number plus coins. Building uses no materials, and nothing can be damaged, repaired, moved or claimed. The engine writes to tiles in only two places (a grave, the bridge), the renderer assumes graves are the only tiles that change, and homeOf() throws when someone has no home, so destroying a house would crash the sim. Ownership only exists implicitly and case by case, and so does grievance: 23 nudgeAffinity calls with hand-tuned constants and a closed CrimeKind list. \"Destroy someone's house and they are pissed\" cannot even be expressed. On the affordance side, buildOptions is 484 hand-written lines, and each verb touches about 9 code sites. Menus run a median of 30 options (max 52), with 13 options that appear in essentially every menu. Kindness verbs only ever target the single nearest person. I measured that when a household member is in sight, none of them can be given to, lent to or complimented in 62-81% of decisions. The fix: a generic Thing table (location, owner, hp, contents, version), item bundles with recipes, a verb table with one executor, a generic Harm record that the psyche and the in-flight justice system both consume, per-agent last-seen knowledge of things, and a family-stratified top-K menu builder. A scratch prototype of that builder yields 29 options from 282 raw candidates (361 max, which would already exceed JEV's 255 limit) in 0.075 ms, and makes household members targetable 91% of the time. Caveats: all behavioural numbers use the deterministic fake JEV, so they reflect the gating code, not real choices. engine.ts was being edited by another session during this audit (it grew from 3,298 to 3,307 lines), so line numbers may drift by a few.",
+  "fundamentals": [
+   {
+    "title": "Add a Thing table: every object has a location, owner, durability, contents and a version",
+    "problem": "No entity or object model exists. Buildings are fixed, immutable records with no owner, hp or contents. Containers are separate one-off structures: one Project, one Pantry, homeFood keyed by building id, and shops keyed by a closed ShopId union. The engine can change tiles in only two ways (burying someone, finishing the bridge). The renderer caches a static layer on the assumption that nothing else changes. Code that looks up a home or workplace throws or asserts non-null. So building a second house, destroying one, opening a new shop, or leaving someone homeless all need new bespoke code, and some would crash today. After the footbridge is finished, the carpenter's job has nothing to build.",
+    "evidence": "lib/sim/town-map.ts:3 'Hand-laid and fixed'; lib/sim/types.ts:57-72 (Building has no owner/hp/contents), :92 Project, :108 ShopId = 'store'|'diner'|'inn', :415 project: Project (one only), :416 pantry: Pantry, :418 homeFood, :419 shops: Record<ShopId, Shop>; lib/sim/engine.ts:1564 (grave tile) and :1900 (bridge tile) are the only tile writes; components/sandbox/world-canvas.tsx:251 'Graves are the only tiles that change after a world is created'; lib/sim/engine.ts:305 homeOf throws 'No home for'; :315 buildingOf(kind)!; :549 buildSession returns 'The footbridge is already finished.'; lib/sim/jobs.ts:85-88 carpenter place 'bridge', doing 'work on the footbridge'",
+    "proposal": "Add World.things: Record<string, Thing>, where Thing = { id, kind: ThingKindId, pos: Vec, size: Vec, holder: {agentId}|{thingId}|null, owner: Owner, access: 'public'|string[], hp, maxHp, state: 'planned'|'building'|'standing'|'damaged'|'ruined', progress, contents: Bundle, coins, builtBy: Record<agentId, units>, business?: Business, version, lastChange: {tick, verb, actorId|null} }. Add a pure THING_KINDS table: { name, blocks, enterable, movable, maxHp, value, recipe: {materials: Bundle, work}, capacity, verbs: VerbId[] }. Maintain a spatial index thingsAt: Map<tileIdx, id[]> and a blocked: Uint8Array overlay that isWalkable consults, rebuilt when a blocking Thing changes. Migrate buildings, pantries, homeFood, shop stock and tills, the project, bushes and graves into Things, keeping hours as a component. homeOf returns Thing|null, and being homeless becomes a valid state (sleep rough).",
+    "unlocks": "Build, destroy and rearrange things; property rights; new homes, shops and shared structures for self-organization; a real economy; a full stateful world that can be persisted and diffed",
+    "impact": 5,
+    "cost": "L"
+   },
+   {
+    "title": "Replace the single food number with item bundles, and make building consume materials",
+    "problem": "Agent.carry is one number of 'food'. Berries, produce, fish and groceries all merge into it, and selling sells all of it. The only goods are food and coins, so nothing can be gathered as a resource (wood, stone), crafted, or traded by kind. Building consumes time only (sessionsDone += amount), so construction does not tie into gathering or the economy.",
+    "evidence": "lib/sim/types.ts:331 carry: number ('Food portions carried (berries or fish)'), :332 coins; lib/sim/engine.ts finishWork (farmer and fisher both add to agent.carry, ~515-527); buy adds groceries to carry and sell uses n = min(agent.carry, ...) in arrive (~1810-1835); buildSession :547-560 consumes no materials; docs/society-spec.md:996-1015 already sketches Stack/Store/Owner but it is not implemented",
+    "proposal": "Add ItemKind = 'berries'|'produce'|'fish'|'groceries'|'meal'|'wood'|'stone'|'tools', with an ITEMS table {hunger, spoilsTicks, weight, baseValue}. Bundle = Partial<Record<ItemKind, number>>. Agent.carry becomes a Bundle with a weight cap. Route every movement of goods or coins through transfer(from: Holder, to: Holder, bundle, coins, mode, byId), where Holder = agent | thing, and extend the existing conservation test to items. THING_KINDS recipes spend materials per work unit from the planned Thing's contents, so anyone can donate materials to a build with put(wood). Material sources are Things: east-woods trees and rock outcrops yield wood or stone into carry, lose hp as they are worked, and regrow. Prices are per (business, item).",
+    "unlocks": "Gathering resources, construction from materials, production chains, buying and selling by kind, and exploitation or charity over specific goods",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Make ownership data, and make a generic Harm record the only source of property grievance",
+    "problem": "No owner field exists anywhere. Who owns what is inferred case by case (Building.residents, Shop.keeperId). What counts as a crime is written inside each verb, so recordCrime('pantry_theft') lives inside arrive(). Grievance is 23 separate nudgeAffinity calls with hand-tuned constants. The crime and life-event lists are closed. So damaging someone's house cannot make them angry unless someone hand-writes that exact consequence. The victim's reaction is a constant, not a choice shaped by their psychology.",
+    "evidence": "lib/sim/engine.ts nudgeAffinity at 23 sites (grep), e.g. -0.6 murder witness ~1588, -0.15 pantry witness ~1777, -0.35 lie found ~1877, -0.3 default ~2461; engine.ts:1780 recordCrime(world, 'pantry_theft', ...) inline in arrive; lib/sim/types.ts:203 CrimeKind = 'pickpocket'|'pantry_theft'|'assault'|'murder'; lib/sim/drift.ts:86-95 LifeEvent has no property harm; counted 100 remember(), 79 count(world), 54 needs clamps in engine.ts",
+    "proposal": "Owner = {kind:'agent',id}|{kind:'household',id}|{kind:'group',id}|{kind:'town'}|{kind:'none'}. permission(actor, thing, verb) returns 'own'|'granted'|'public'|'trespass', computed from owner and access. The verb executor emits Harm = { id, tick, verb, actorId, thingId, ownerIds, value (from THING_KINDS.value and the hp or items lost), witnesses, knownBy: {agentId, how:'saw'|'found'|'told', suspectIds}[] } whenever a verb reduces the value of something whose owner is not the actor, without consent. A single onHarmKnown(victim, harm) writes the memory, calls wrongedBy, adds a new lifeEvent 'property_harmed' scaled by value (and more when the victim built it or lives in it), and issues a JEV appraise choice: 'You find the Vale house door smashed; Rook was near it this morning' with options confront | report | retaliate | repair | demand_restitution | let_go. The anger comes from JEV reading the psyche, not from a constant. The in-flight justice system reads Harm through a norm table (verb x permission to crime kind), so vandalism, arson, trespass and property theft become crimes without new justice code.",
+    "unlocks": "'Destroy someone's house and they are pissed', revenge and restitution loops, property crimes feeding police cases, generosity measured against real sacrifice",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Replace bespoke option code with a verb table and one executor",
+    "problem": "Every behaviour is hand-written across many places. buildOptions is 484 lines. Each intent has cases in 6 switch statements plus ACT_TICKS and the Intent union, and each offer has 3 more switches. A verb like 'deposit' appears 9 times in engine.ts. Children are gated by a regex on option-id prefixes. The spec's ACTIONS table was never built, and it is still one verb per situation (take_<store>, fetch_<store>) rather than generic verbs over objects. Adding destroy, repair, move, claim and build-your-own would mean roughly 9 new code sites per verb.",
+    "evidence": "lib/sim/engine.ts:1029-1512 buildOptions; switch(intent.kind) at :584 goalFor, :642 happensInside, :682 intentPhrase, :1657 arrive, :1915 finishActing, :2295 applyActing; ACT_TICKS :90-114; types.ts:244 Intent union (27 kinds); engine.ts:1027 ADULT_ONLY regex; grep '\"deposit\"' = 9 hits in engine.ts; docs/society-spec.md:1749-1770 (unimplemented ActionDef)",
+    "proposal": "VERBS: Record<VerbId, VerbDef>, where VerbDef = { family: 'body'|'work'|'build'|'property'|'kind'|'hostile'|'civic'|'leisure', target: 'self'|'thing'|'agent'|'thing+item', gate(ctx): physical and knowledge facts only, adultOnly, ticks(ctx), effects(ctx): {needs, transfers, thingDelta}, harm(ctx): Harm|null, drivers(ctx), label(ctx), detail(ctx) with slots What/Where/Effects/Who would know }. There are about 18 generic verbs: eat, drink, sleep, gather, craft, plan, build, repair, damage, demolish, pick_up, place, take, put, give, trade, claim, enter, use (a business's service), plus the existing agent offers. THING_KINDS[k].verbs and Business components say which verbs apply to what. One runVerb(world, agent, verb, target) handles path goal (from the target's door or position), then arrive, then act per tick, then finish. The old switches collapse into it. Keep Intent = {verb, targetId, item?, qty?, params}.",
+    "unlocks": "Adding a new interaction (break, rearrange, build a fence) becomes one table row. The option text, physics and UI all share one source.",
+    "impact": 5,
+    "cost": "L"
+   },
+   {
+    "title": "Build menus by top-K relevance, with a fixed quota per family",
+    "problem": "Menus are truncated by fixed rules, not ranked by relevance. Gifts, pleas, loans and pickpocketing are offered only to the single nearest person. Chat goes to the 3 nearest. Hostility goes to the lowest-affinity adult within 8 steps. All 7 explore options appear in every menu. So villagers mostly cannot be kind to family or friends, or confront the person who wronged them without violence, while filler options take up menu space.",
+    "evidence": "lib/sim/engine.ts:1257-1260 approachable = nearest 3 (TALK_OPTIONS); :1271 compliment only for approachable[0]; :1281 nearest = approachable[0] gets gift/ask/lie/lend/usury/pickpocket; :1441 foe = min affinity within 8; :1479 every POI becomes an explore option. Measured (scratch targets.ts, 2,880 ticks, fake JEV): when someone with |affinity|>=0.3 is in sight, none of them is giftable, lendable or complimentable in 544/942 (58%, seed 31) and 419/800 (52%, seed 7) of decisions; household member in sight but none kindness-targetable in 162/200 (81%) and 172/277 (62%); a grudge target in sight has only violence verbs in 42/102 (41%) and 8/13 (62%). Measured menus (scratch menus.ts): p50 30, p90 35, max 52 options; explore averages 7.0 per menu (5,187 over 741 menus)",
+    "proposal": "enumerate(world, agent): candidates = VERBS x targets. Targets are Things the agent knows (in sight via thingsAt, owned, or in seen memory) and people (in sight, plus household, plus the top 3 by |affinity|, plus grudges and gratitude, plus debt counterparties). Score each candidate from facts only, never traits (the AGENTS.md rule that psychology never ranks options): 1/(1+steps/10), plus need match (the sum of need deficits times the verb's effect on each need), plus |affinity|, plus 0.5 for a grudge or gratitude, plus ownership (own or household), plus salience (the thing's version changed since last seen, or an unresolved Harm), minus a novelty penalty if chosen in the last 6 decisions. Dedupe to one instance per (verb, thing kind, owner class), keeping the best, with at most 2 targets per verb. Fill fixed family quotas (body 5, work 3, build 4, property 4, kind 6, hostile 4, civic 3, leisure 3; total <= 32), so the ratio of prosocial to antisocial options comes from the table, not the situation. Always include rest. Store the scores and what was cut (truncated) on the DecisionRecord. Scratch prototype (affordances.ts, 75 Things from the live world plus 40 trees and 5 movables): raw candidates p50 282, max 361; menu 29; 0.075 ms p50 and 0.56 ms p99 per call, against 0.096 ms for today's buildOptions; a household member in sight is kindness-targetable in 119/131 (91%).",
+    "unlocks": "Kindness toward chosen people, targeted revenge, bounded and readable JEV menus as the world grows past 255 possible actions, auditable truncation",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Replace omniscient object state with per-agent last-seen knowledge and discovery",
+    "problem": "Every villager's perception includes live pantry counts and the status, price and stock of every shop, wherever they are, and option details quote live counts. The only knowledge store is Agent.knows for crimes. Theft discovery is a one-off scalar (missingCoins). For property harm to cause a grievance, the owner has to find out, and must be able to suspect the wrong person. Omniscience would also make the state text grow with every new Thing.",
+    "evidence": "lib/sim/engine.ts:929-931 placeLine for all three shops in every perception; :958 chapel pantry count always; :1241 option detail quotes live pantry food; :1002 noticing.slice(0, 32); lib/sim/types.ts:337 missingCoins, :351 knows (crimes only). Measured (scratch state.ts): state text p50 3,518 chars, p90 4,040; noticing lines p50 17, max 27",
+    "proposal": "Add Agent.seen: Record<thingId, {v, tick, hp, contents?: Bundle, price?}>, refreshed whenever a Thing is in sight or the agent is inside it. Perception and verb labels read from seen (stated as last seen at <time>), never live state. On arrival, verbs re-check real state and cancel with a memory if it differs. If an agent sees a Thing they own whose version has advanced and a Harm they don't yet know about, discovery fires onHarmKnown with how = 'found' and suspects = the people this agent saw near it during that window. The suspects can be wrong. The perception shows owned Things (state plus last change), Things in sight, and the top 5 remembered by salience, so the text stays bounded.",
+    "unlocks": "Finding out about vandalism or theft, wrong accusations, rumours and gossip about property, legible state text as the world grows",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Make construction, destruction, repair and rearranging physics that change function",
+    "problem": "Given Things and items, the verbs still need consequences that come from world state rather than hand-written text. Today the only lasting world changes are graves and a finished bridge, and a building's function (home, shop, clinic) never depends on its condition.",
+    "evidence": "lib/sim/engine.ts:1892-1913 completeProject (the only build outcome, flips tiles to 'bridge'); :547-560 buildSession; world-canvas.tsx:251-255 static cache invalidated only on graves.length; step() already cancels a move when the next tile is unwalkable (engine.ts moving case, 'if (!isWalkable(...)) becomeIdle')",
+    "proposal": "plan: on a free lot or free tiles, offer the top 2 buildable kinds x 2 nearest free sites. This creates Thing{state:'planned'}, owned by the planner (or by the town or a group when planned at the town hall). build: spends recipe materials from the Thing's contents plus work units, and credits builtBy. damage: hp drops by effort times tools. demolish: at hp 0 the state becomes 'ruined' and the contents spill into a pile Thing that stays owned by the original owner, so taking from it is theft. repair: materials restore hp. pick_up and place: move movable Things (bench, crate, fence segment), updating the blocked overlay; in-flight paths already fail safely. Function follows state: a damaged home restores less energy and leaves its food unsecured; a ruined home makes its residents homeless; a ruined business cannot serve. Each change bumps a world.thingsVersion that the canvas uses to redraw its Things layer.",
+    "unlocks": "Rearranging the village, building homes and fences, sabotage and repair, visible long-term traces of what people did",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Attach businesses and workplaces to Things instead of fixed building kinds",
+    "problem": "Institutions are hardwired one per building kind, so villagers cannot organize anything new: no second shop, no market stall run by a group, no co-owned shed. Jobs resolve their workplace with buildingOf(kind)!. The shops are a closed three-key record, each selling one good at one price.",
+    "evidence": "lib/sim/types.ts:108 ShopId closed union, :110-125 Shop has one good and one price; lib/sim/engine.ts:406-410 workBuilding uses buildingOf(world, job.place); :315 buildingOf with non-null assertion; lib/sim/jobs.ts:12 place: BuildingKind | 'fields' | ...",
+    "proposal": "Business = { owner: Owner, keeperIds, sells: Partial<Record<ItemKind, number>>, buys: Partial<Record<ItemKind, number>>, hours, open when a keeper is inside (keep today's rule) }, stored on Thing.business, with the till as Thing.coins. Verbs: open_business (on a Thing you own), set_price (item, tier), hire (a respond offer), close_business. Jobs point to workplaceId: thingId. Group-owned Things with access lists (a crew's shed, a shared pantry) let pooled property and membership emerge from verbs rather than code.",
+    "unlocks": "Self-organizing groups with shared property, competing businesses, price manipulation and cartels, new jobs appearing",
+    "impact": 3,
+    "cost": "M"
+   }
+  ],
+  "measurements": [
+   {
+    "what": "Headless tick cost",
+    "value": "0.20 ms per tick; 1,440 ticks (5 days) in 291 ms with 905 JEV calls",
+    "how": "bun /Users/claudiofuentes/Repos/jev-sandbox/scripts/probe.ts 31 1440 (fake JEV)"
+   },
+   {
+    "what": "Decision menu size",
+    "value": "min 14, p50 30, p90 35, max 52 options over 741 decides",
+    "how": "scratch menus.ts: Session seed 31, 1,440 ticks, fakeAnswer, counted req.options per decide request"
+   },
+   {
+    "what": "Criteria text per decide call",
+    "value": "p50 4,248 chars, p90 4,860, max 6,571",
+    "how": "scratch menus.ts: sum of label + detail per option"
+   },
+   {
+    "what": "Static options present in every menu",
+    "value": "explore_* averages 7.0 per menu (5,187 over 741); eat, drink, sleep, plaza, wander and rest each appear 741/741; about 13 of 30 median options",
+    "how": "scratch menus.ts: option intent-kind frequency"
+   },
+   {
+    "what": "buildOptions and perceive cost",
+    "value": "0.096 ms and 0.071 ms per agent call",
+    "how": "scratch menus.ts: 200 repetitions over all alive agents on the tick-1440 world"
+   },
+   {
+    "what": "Strong tie in sight but not kindness-targetable",
+    "value": "58% (544/942, seed 31) and 52% (419/800, seed 7) of decisions",
+    "how": "scratch targets.ts: 2,880 ticks; person with |affinity|>=0.3 within 18 tiles; none targeted by gift, lend, ask or compliment options"
+   },
+   {
+    "what": "Household member in sight but not kindness-targetable",
+    "value": "81% (162/200, seed 31) and 62% (172/277, seed 7)",
+    "how": "scratch targets.ts, same run"
+   },
+   {
+    "what": "Grudge target in sight with only violence offered toward them",
+    "value": "41% (42/102, seed 31) and 62% (8/13, seed 7)",
+    "how": "scratch targets.ts: no non-attack approach option targets any grudge-holder in sight"
+   },
+   {
+    "what": "Prototype generic affordance space",
+    "value": "75 Things; raw candidates p50 282, max 361 (over JEV's 255); stratified menu 29; enumerate 0.075 ms p50, 0.561 ms p99; household member in sight kindness-targetable in 91% (119/131)",
+    "how": "scratch affordances.ts: Things derived from the live world (21 buildings, 6 bushes, 40 woods trees, 5 movables, bridge, 2 lots) and a quota-stratified top-K"
+   },
+   {
+    "what": "Perception state text",
+    "value": "p50 3,518 chars, p90 4,040, max 4,663; noticing lines p50 17, max 27; people lines p50 8",
+    "how": "scratch state.ts: buildState(req.perception) per decide"
+   },
+   {
+    "what": "Pathfinding primitives",
+    "value": "distanceField 0.044 ms, stepsTo full scan 0.005 ms",
+    "how": "scratch state.ts: 5,000 repetitions on the tick-1440 world"
+   },
+   {
+    "what": "World snapshot size",
+    "value": "1,006,529 bytes of JSON at tick 1,440; agents 948,762; decisions about 59,307 bytes per agent (full state text in each DecisionRecord); tiles 11,638",
+    "how": "scratch size.ts: JSON.stringify per World key and per Agent key"
+   },
+   {
+    "what": "Places where the world can change",
+    "value": "2 tile writes in engine.ts (grave at :1564, bridge at :1900); 0 owner fields; 23 nudgeAffinity sites with fixed constants; 6 switch(intent.kind) plus 3 switch(offer.kind) sites",
+    "how": "grep over lib/sim/engine.ts and lib/sim/types.ts"
+   }
+  ],
+  "quick_wins": [
+   "Offer gift, lend, ask and compliment toward the household plus the top 2 people in sight by |affinity|, not only approachable[0] (engine.ts:1281). This fixes the measured 52-81% cases where family and friends are unreachable, in about 15 lines.",
+   "Cap explore_* at the 2 least recently visited places (engine.ts:1479 loop; the spec's cap table already says so). That removes 5 filler options from every menu.",
+   "Change homeOf (engine.ts:303-306) to return null instead of throwing, and handle homelessness (sleep rough). This must happen before any eviction or destruction verb.",
+   "Replace the ADULT_ONLY regex on option-id prefixes (engine.ts:1027) with an adultOnly flag on each option or verb, so renaming an id cannot silently let a child through.",
+   "Compute distanceField once per decision and share it between perceive and buildOptions. Look up distance for door or position goals with field[idx(door)] instead of stepsTo full scans.",
+   "Stop storing full JEV state text in every DecisionRecord inside World. Decisions take 59 KB per agent (949 KB of the 1.0 MB snapshot), which matters for the in-flight server persistence. Keep the text in the session log, or store a hash and recompute.",
+   "Add a world.thingsVersion (or dirty counter) and invalidate the world-canvas static layer on it, instead of on graves.length (world-canvas.tsx:251), before adding any new mutable object.",
+   "Add a 'property_harmed' LifeEvent to drift.ts EVENTS (trust -3, neuroticism +1) so harm feeds trait drift as soon as Harm records exist."
+  ]
+ },
+ {
+  "lens": "social structure and self-organization",
+  "summary": "Fernhollow has none of the primitives self-organization needs. There are no collectives, memberships, shared purses, proposals, votes, rules or elected offices, and no beliefs that pass from one mind to another. Every social act is between two people and the target is picked by distance: gifts, loans, pleas and pickpocketing go only to the single nearest person outdoors, and people sitting together inside the Lantern, diner or chapel can never address each other. In real JEV records, 88-95% of approaches went to the nearest person, even though JEV put 31-41% of its probability on approaching someone. So the missing groups, alliances, reputations and norms are not JEV declining to choose them: the option space cannot express them. The spec designs much of this (Slice B, M6/M7/M17/M19), but it splits it into town-only ordinances and clubs that are little more than labels; the fix is one generic Collective + Proposal/Meeting/Vote + Rule-as-data trio that the town, households and emergent groups all instantiate. Add to that a belief store so opinions travel, and \"whom\" as its own JEV choice. Pilot, per the dogfood rule: ship the whom-choice and talking to people in the same building first. Then make the chapel pantry the first commons its users govern: any member can call a chapel meeting, propose a take-limit rule, attendees vote, and violations feed the in-flight Case system. Run 2-3 real JEV days; it passes if at least one rule is proposed and adopted by vote and at least one violation is reported under it. (Line numbers refer to the working tree at about 20:00 on 2026-09-23, which a parallel agent is still editing.)",
+  "fundamentals": [
+   {
+    "title": "Let villagers choose whom, and talk to whoever is in the room",
+    "problem": "Person-directed options are built from distance alone. Talk goes to the 3 nearest people who can be approached. Compliment, gift, lend, plea, lie and pickpocket go only to the single nearest one. Violence is the exception: it targets the least-liked adult within 8 steps. So hatred can choose its target, but love, loyalty and alliance cannot. canApproach excludes anyone inside a building, and a chase is abandoned when the target goes indoors. The Lantern, diner, chapel and town hall, the natural places for groups to form, therefore put people in the same room without letting them interact.",
+    "evidence": "engine.ts:879-881 canApproach returns !target.inside; engine.ts:1257-1260 approachable.slice(0, TALK_OPTIONS=3); engine.ts:1281 `const nearest = approachable[0]` gates give/lend/ask/lie/usury/pickpocket; engine.ts:1441 foe = least-liked within 8 steps; engine.ts:2200 chase gives up when the target goes inside. Measured in real-JEV lab records (seed 600, ticks before the desync): 63 of 72 and 100 of 105 chosen approaches went to the nearest person, while approach options held 31% and 41% of JEV's probability. Fake JEV, 5 seeds x 7 days: at most 1 transfer target per decision, and the most-liked person was the gift target in only 9.5% of gift-offering decisions. Indoor test: Hollis, inside the Rusty Lantern with Lark and Mo listed as 'here with you', got 10 person options, all aimed at people outside (talk_bram, pickpocket_bram, attack_bram and others).",
+    "proposal": "Collapse the per-person duplicate options into one option per act with a placeholder target, for example 'Give 1 food to someone', 'Lend 5 coins to someone', 'Go talk to someone', 'Say something kind to someone', 'Pick someone's pocket', 'Attack someone'. When JEV picks one, issue a follow-up `whom` choice call conditioned on that act. Its criteria are every living person the chooser knows (255 at most), each labelled with relationship and location, e.g. 'Mo (cook): you like her; she helped you twice this week; last seen at the diner 20 min ago, 14 steps'. Add `Intent.seek {offer, targetId}`, which walks to the person's believed location and falls back to the existing giveUpTalk. Change canApproach so a person in the same building as the asker counts (reuse canSee). Keep today's nearest-person default only as the fallback when a whom call fails. Cost: one extra call, only on person-directed picks (about 30% of decisions), at the measured ~$0.0001 each.",
+    "unlocks": "Being kind to a specific person, favouritism, reciprocity, alliances and in-group bias, with revenge and loyalty on an equal footing. Recruiting members (Collective) and canvassing votes (Meetings) both depend on it. It also frees about 8-10 option slots under the 64-option cap.",
+    "impact": 5,
+    "cost": "S"
+   },
+   {
+    "title": "A belief layer: perception reads what you know, and talk carries claims",
+    "problem": "Minds read the world's true state directly, and no information passes between minds. Every perception carries six world-level facts wherever the villager is standing: the exact pantry count, the footbridge percentage with its full contributor list, all three shops' status and prices, and the berries. A chat carries no content: it adds social need and +0.1 liking. Knowledge of crimes (Agent.knows, a list of crime ids) spreads only by eyewitness, a report to the officer, or the Crier. The Crier's headlines come from a regex over the journalist's memories, not from her choice. So opinions cannot spread, reputations cannot form or be manipulated, and nobody can recruit anyone. It also breaks the spec's own rule that reputation exists only in beliefs and ties: the engine broadcasts who built the bridge to everyone.",
+    "evidence": "engine.ts:929-931 and 958-964 are the global lines; engine.ts:863-867 contributorsPhrase; the chat tick at engine.ts:2572-2580 and applyChatReply at 3055 (a yes/no engage question only, prompt.ts respondQuestions); printEdition regex at engine.ts:563-579. Measured over 4229 decisions: 6 global-state lines in every perception (minimum 6). Each crime was known to 22% of the living on average, 43% at p90. In the real replays the oldest memory shown to JEV was a median 4-5 hours old (MEMORY_IN_PROMPT=7), so anything learned in the morning is gone by evening unless it is stored as a record.",
+    "proposal": "World.beliefs, indexed by holder: `Belief = { id, holderId, about: {kind: 'agent'|'collective'|'store'|'project'|'rule', id}, claim: 'did_crime'|'broke_rule'|'helped'|'pledged'|'defaulted'|'member_of'|'holds_office'|'store_level'|'supports'|'meeting_at', ref, source: 'saw'|{toldBy}|'read_board', credence: 0..1, tick }`. `perceive` renders public facts from the holder's beliefs, with their age ('when you last looked, Tue 3 pm, the pantry held 4'), and sight refreshes those beliefs. Chat gets a topic: when a chat starts, the speaker answers a `topic` choice over up to 8 salient beliefs, plus 'small talk', plus 'make up something about X' (tagged with the deception driver). The listener answers `believe` in the same reply call, a 0-4 score mapped to credence as EV/4, and the belief is copied with its source chain. `knows` becomes a view over did_crime beliefs, so the in-flight justice code keeps working and reports can be hearsay with a credence. The journalist's edition becomes a JEV choice over her own beliefs.",
+    "unlocks": "Opinions spreading, gossip, reputation, manipulation and propaganda, recruiting into groups, and calling meetings by word of mouth. It also gives 'destroy someone's house and their friends are angry too' its path, and makes the Crier matter.",
+    "impact": 5,
+    "cost": "L"
+   },
+   {
+    "title": "Collective as a first-class record: the town, households and groups are the same thing",
+    "problem": "Nothing bigger than one person has a record. There are no groups, no membership, no roles, no shared purse and no gathering schedule. The town is a bundle of globals (treasury, taxRate, worked) that nobody controls. The spec's Group type (club, union, congregation or crew, with a purse and a weekly gathering) has no rules, dues or meetings of its own. Rules and votes live only in town-hall Ordinance and Meeting records, so only the town can make rules. That is institutions handed down, not self-organization.",
+    "evidence": "types.ts World has no groups or collectives, and Town is only {treasury, taxRate, worked}. Spec lines 1155-1163: Group has no ruleIds, dues or meetings. Spec lines 1064-1069: Meeting and Ordinance exist only for the town. Spec M19 at 2265-2284.",
+    "proposal": "`Collective = { id, kind: 'town'|'household'|'club'|'crew'|'congregation'|'union', name (a choice among 4 seeded names per kind), parentId (the town, for nesting), members: Record<agentId, {since, role: 'member'|'leader'|officeId}>, purse: {food, coins}, home: buildingId|poiId, gathering: {weekday, minute}|null, ruleIds, foundedBy, foundedTick }`. The town's purse is the treasury. World creation makes only c_town (every resident) and one household collective per home; every other collective has to be founded. Options are generated from these records, not from code branches: `found_<kind>` (a talk offer; a yes reply makes the listener the first member), `invite_<cid>` and `ask_join_<cid>` (answered by the leader or any member present), `leave_<cid>`, `give_to_<cid>`, `take_from_<cid>` (witnessed and checked against its rules), and `attend_<cid>` at gathering time. Perception gets one line per membership: size, leader, purse, and what its rules ask of you this week.",
+    "unlocks": "Groups forming, factions, self-organization, pooled resources, shared treasuries and nesting (Ostrom's principle 8). Groups get meetings, rules and projects from the same code as the town.",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Proposals, meetings and votes as the one collective-choice procedure",
+    "problem": "No villager can call a meeting, propose anything, vote or elect. The only collective project was approved before tick 0. The mayor's job is flavour: an hour at the town hall adds respect +3. The tax rate is a constant, and the mayor and officer hold office by persona data forever. Collective choice, the step that turns many preferences into shared state, is missing.",
+    "evidence": "engine.ts:535-537, the mayor's work case (respect only); SALES_TAX is a constant at engine.ts:84, applied once at 241; personas.ts:394 'Tomas appointed you chief of police.'; the project is fixed at engine.ts:223-232; types.ts has no meeting or vote types; spec M6 (2026-2067) designs these only for the town hall.",
+    "proposal": "`Proposal = { id, collectiveId, kind: 'adopt_rule'|'repeal_rule'|'elect'|'spend'|'start_project'|'admit'|'expel'|'set_dues'|'dissolve', params, proposerId, meetingId, status }` and `Meeting = { id, collectiveId, calledBy, place, tick, agenda, attendees, ballot: 'open'|'secret', votes: Record<proposalId, Record<agentId, string>> }`. A pure `proposalCatalog(world, collective, proposer)` lists concrete typed items, capped at 255: rule templates with 2-3 parameter values each, candidates for each office, spend amounts per project. Any member can pick `call_meeting_<cid>` and then answers an `agenda` choice over the catalog (1-2 items), so JEV never writes rule text. The meeting becomes a notice at the collective's place and a meeting_at belief for anyone present or told. When it starts, members who are there enter a `meeting` status, and each attendee gets one `vote` call per item (yes/no/abstain, or candidates plus abstain). Under an open ballot the calls run in sequence and each voter's state lists the declarations made before theirs. A majority of attendees decides, with a quorum of ceil(members/3), and a pure `enact(world, proposal)` applies the result. The town's weekly meeting is simply c_town's gathering. Cost: 10 attendees x 2 items = 20 calls, about $0.002. At the measured median latency of 250 ms, an open ballot takes about 2.5 s.",
+    "unlocks": "Town meetings and voting, elections, collective action, spending from a purse, expulsion and banishment, and legitimacy experiments. It also makes herding under open ballots measurable.",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Rules as data that agents see, obey or break, and justice enforces",
+    "problem": "What counts as wrong is written into the engine, not chosen by anyone. CrimeKind is a fixed union. 'Pantry theft' is defined by the engine's own need test (hunger under 30, or unable to afford groceries), and the same test sets the option's driver tag. Fines are constants per crime kind. Nobody can make a rule (a pantry limit, curfew, price cap, dues), so there can be no norms, no one pushing for new norms, no breaking of a rule the town itself chose, and no norms changing over time. The in-flight justice system therefore enforces the programmer's laws.",
+    "evidence": "types.ts:203 CrimeKind; engine.ts:1243 and 1766 apply the need test; engine.ts:1780 records pantry_theft; engine.ts:1413 hard-codes fine amounts; Ordinance and SanctionLevel exist only in the spec (lines 1067-1068).",
+    "proposal": "`Rule = { id, collectiveId, template, params, sanction: 0..4 (warn, fine, repay double, night in the cell, expel or banish), adoptedBy: proposalId|'county', adoptedTick, status }`, drawn from a fixed catalog of about 40 templates or fewer: take_limit(storeId, n per day), members_only(storeId), need_only(storeId), dues(kind, n per week), work_levy(projectId, hours per week), price_cap(good, max), curfew(hour), no_theft, no_violence, attend_gathering, tax_rate(pct), banish(agentId). A pure `violations(world, actor, act): Rule[]` runs wherever an act resolves (arrive, applyResponse). A violation creates the in-flight Crime with `kind: {rule: ruleId}`, plus beliefs for witnesses ('you saw Hollis take a second portion; the town voted a one-a-day limit on Thursday'). Option details say it honestly: 'This breaks the town's pantry rule (sanction: a fine)'. Case options for the officer or a collective's monitor are generated from known violations, and the sanction ladder comes from the rule. Murder, assault and theft stay in force as rules adopted by 'county', so the in-flight work stays valid.",
+    "unlocks": "Norms and sanctions; rules agents can see, vote on, obey or break; justice enforcing law the town made itself; Ostrom's principles 2, 3 and 5; game-theory experiments on compliance versus enforcement.",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Offices as seats that can be vacated, contested and filled",
+    "problem": "Institutional roles are welded to persona.job, which nothing ever reassigns. The officer is found as the living person whose job is police_officer, and the store opens only while its fixed keeper is inside. With murder now in flight, one death can permanently disable justice or the town's only grocery. There is no election, appointment, succession, deputy or removal from office, so leadership cannot emerge or be contested.",
+    "evidence": "engine.ts:1519 officerOf; engine.ts:1386 gates case options on persona.job; engine.ts:347 shopOpen requires the fixed keeperId; no code anywhere assigns persona.job (grep). Measured with fake JEV, seed 7: after killing Odile and Sable at tick 5, the next 4 days had 30 crimes, 0 decisions offering a report or case option, 0 cases and 0 store purchases.",
+    "proposal": "`Office = { id, collectiveId, title, holderId|null, powers: ('open_case'|'arrest'|'fine'|'set_agenda'|'spend_purse_upto'|'appoint_acting'|'keep_store'|'set_price')[], term|null, since, filledBy: proposalId|'founding' }`. Every power-gated option checks `holds(world, agent, power)` instead of persona.job; persona.job only seeds the first holder. Death, jail, leaving town or a `resign_<office>` option empties the seat, and `elect(office)` is added to the collective's next meeting agenda automatically. An office with appoint_acting lets its holder name a stand-in through a whom choice. Groups create their own offices (leader, treasurer, monitor) by proposal.",
+    "unlocks": "Leadership, elections, succession after a murder, abuse of office and legitimacy. It also lets the justice system survive the violence it now makes possible.",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Commons governed by their users (Ostrom)",
+    "problem": "The chapel pantry and the berry bushes are open to all, with etiquette the engine defines. Anyone may take 2 per trip, 'meant for those in need' is only prose, the engine decides who is in need, and monitoring is whoever happens to be in the chapel. There is no collective choice about access, no ledger, no graduated sanction and no monitor. The berries have no rule at all, and the treasury is a commons nobody can spend. Every Ostrom design principle needs the Collective, Rule, Meeting and Office primitives. Without them a tragedy of the commons, or its avoidance, can only be scripted, never emerge.",
+    "evidence": "engine.ts:1239-1245 take_store option; engine.ts:1762-1790 take physics with the engine's need test; engine.ts:2368 regrowBerries has no access control; the treasury moves only through payroll and deliveries in townDay (engine.ts:2377).",
+    "proposal": "Every shared store becomes `Store { id, ownerCollectiveId, food, coins, ledger: {tick, agentId, delta}[] }`: the pantry is owned by c_town or a founded congregation, and each grove of bushes is a store owned by c_town. Access goes through rules (take_limit, members_only, need_only). The ledger can be read at the store (a read_ledger option creates store_level and took beliefs), and that is the monitoring. A monitor office gets case options for violations it knows about. Sanctions follow the rule's ladder and escalate with repeat offences. This is the first vertical slice to build and dogfood on the Collective, Meeting, Rule and Office primitives.",
+    "unlocks": "Governed shared resources (Ostrom), measurable free-riding, and self-organization around scarcity (the famine intervention becomes a test of governance). It also brings treasury politics.",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Projects proposed, funded and pledged, not pre-approved",
+    "problem": "The footbridge is the only collective action, and it was approved before tick 0. The world holds one Project, contributions take no inputs (no wood, coins or pooled resources), and once it is finished nothing can ever be built again. Help is asked of individuals hour by hour with no commitment, so free-riding, pledges, broken promises and claiming credit cannot happen. In real runs the paid carpenter did most of the work.",
+    "evidence": "World.project is a single record (types.ts), created at engine.ts:223-232 with BRIDGE_SESSIONS=16 (engine.ts:88); completeProject at engine.ts:1892; the build option at engine.ts:1206 is gated on the bridge being unfinished. Measured with fake JEV: after completion (3 of 5 seeds, at ticks 1141-1901), 0 of 551 decisions offered a build option. In real runs, Wren (the paid carpenter) did 6 of 7 and 5 of 9 sessions, and building/justice/duty options outside work got 2.0% and 2.6% of the probability.",
+    "proposal": "`projects: Project[]` drawn from a template catalog (footbridge, well, shed, a house on lot_a or lot_b, fence, bandstand, memorial). Each has `inputs {sessions, coins, wood}`, a `sponsorId` (a collective or an agent) and `pledges: Commitment[]`, with `Commitment = {id, promiserId, projectId, amount, dueTick, status: 'open'|'kept'|'broken'}` (the spec already declares it). A project starts through a start_project or spend proposal, or privately with the founder's own coins. A `pledge_<project>` option (a choice of amount) creates a commitment shown in perception ('You pledged 2 hours on the well by Friday; you have given 0'). A broken pledge creates beliefs among the collective's members. The global contributor broadcast is replaced by beliefs.",
+    "unlocks": "Building things, collective action, pooling resources, providing, credit and blame, free-rider game theory, and rearranging the village.",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Ties with memory: a visible favours ledger and relationships JEV appraises",
+    "problem": "A relationship is one number moved by 23 hard-coded nudges (+0.1 per chat, -0.6 for an attack, -0.5 for a pickpocket), so feuds and alliances are the engine's arithmetic rather than anyone's judgement. The favours ledger that would let a villager reason 'Mo has helped me three times; I owe her' is recorded but read only by metrics. Perception shows at most 8 feelings lines and 7 memories covering about 5 hours. Third parties never react: harm done to your kin or a fellow member reaches you only if you saw it.",
+    "evidence": "engine.ts:286 nudgeAffinity (23 call sites); favours are written at engine.ts:291-296 and read only in metrics.ts:200 and digest.ts:26; feelings at engine.ts:1007-1014; MEMORY_IN_PROMPT=7 at engine.ts:66; measured memory horizon is a median 4-5 hours in the real replays.",
+    "proposal": "`Tie = { liking, trust, respect, balance (favours given minus received), lastSeen: {place, tick} }` for each directed pair, rendered as people lines: 'Mo: you like and trust her; she has helped you 3 times this week and you have not returned it; last seen at the diner'. After salient events, replace the fixed nudges with a JEV `feel` score (0-4, mapped by EV) asked on the affected person's next call. That includes third parties who hear about it through a belief concerning someone they are tied to or share a collective with. Add the spec's nightly tie_level appraisal for up to 2 people, so small changes stop piling up.",
+    "unlocks": "Reciprocity, alliances, feuds, and 'destroy someone's house and they, their family and their group are angry'. Also in-group bias.",
+    "impact": 3,
+    "cost": "M"
+   },
+   {
+    "title": "Kinship and real households",
+    "problem": "11 of 12 households have one person; the Harrows are the only family. There is no kin record in code (the spec's Kin type is only on paper). So Mo being Pip's sibling, inheritance, family feuds, providing for family, and the household as the first collective are all missing. Stocking the home pantry counts as help only for people who live there.",
+    "evidence": "Measured households: b_inn:1, h_vale:1 and nine more single homes, h_harrow:4 (town-map.ts:197-224). types.ts has no kin; spec sections 3.5 (lines 468-482) and 954-962 describe it; engine.ts:1721 credits help only to co-residents.",
+    "proposal": "`Agent.kin: Record<agentId, 'partner'|'parent'|'child'|'sibling'>`, seeded from spec 3.5. Households become Collectives of kind household, with the home pantry as the purse. Perception adds lines about dependents ('Kit is hungry; your pantry holds 2'). An `invite_to_live` offer changes membership and moves residence. On a death, possessions and business deeds go to the household collective. Partnership and children belong to the family lens and can build on this.",
+    "unlocks": "Providing for family, loyalty to kin, feuds over inheritance, households organizing themselves (moving in, pooling food), and reproduction later.",
+    "impact": 3,
+    "cost": "S"
+   }
+  ],
+  "measurements": [
+   {
+    "what": "Share of chosen approaches aimed at the nearest person (real JEV)",
+    "value": "63/72 (87.5%) and 100/105 (95%); the most-liked person was the target in 21/72 and 56/105",
+    "how": "Replayed runs/fernhollow-founders-s600-20260923233212 and -232832 at HEAD from the recorded answers (no network), up to tick 221, before the first desync; scratchpad/replay-real.ts"
+   },
+   {
+    "what": "JEV probability placed on approach options, and on non-work building/justice/duty options (real JEV)",
+    "value": "Approach 0.31 and 0.41 of each decision on average; building/justice/duty 0.020 and 0.026",
+    "how": "Same replays: summed action probabilities per decide over options by intent and driver tags"
+   },
+   {
+    "what": "Possible targets for transfer acts (gift, lend, plea, lie, pickpocket) per decision",
+    "value": "Max 1, mean 0.97; distinct people across all person options: mean 2.96, max 4",
+    "how": "Fake JEV, seeds 3/7/11/31/99 x 2016 ticks, 4229 decisions; scratchpad/social-audit.ts parsing option ids"
+   },
+   {
+    "what": "Most-liked person is the gift target",
+    "value": "9.5% of 3773 gift-offering decisions",
+    "how": "social-audit.ts: compared the give_* target with the agent's highest-affinity living person at decision time"
+   },
+   {
+    "what": "Talking to people in the same building",
+    "value": "Hollis inside the Rusty Lantern with Lark and Mo 'here with you' got 10 person options, all aimed at people outside (talk_bram, pickpocket_bram, attack_bram and others)",
+    "how": "scratchpad/indoor.ts: createWorld, placed three agents inside the inn, then called buildOptions and perceive"
+   },
+   {
+    "what": "World-state lines in every perception, whatever the location",
+    "value": "Mean 6.0, min 6 per perception (pantry count, footbridge % and contributors, 3 shop lines, berries)",
+    "how": "social-audit.ts regex count over req.perception.noticing for 4229 decisions"
+   },
+   {
+    "what": "How widely each crime is known",
+    "value": "Mean 22% of the living, p90 43%, max 71% (219 crimes)",
+    "how": "social-audit.ts end-of-run count of agent.knows per crime, fake JEV"
+   },
+   {
+    "what": "Memory horizon JEV sees",
+    "value": "Oldest of the 7 memories in the prompt: median 5.25 h and 4.08 h, p90 about 9-11 h",
+    "how": "scratchpad/memory-horizon.ts over the two real replays, decisions after tick 150"
+   },
+   {
+    "what": "Household sizes",
+    "value": "11 of 12 households have 1 person; h_harrow has 4",
+    "how": "social-audit.ts: printed building residents at world creation"
+   },
+   {
+    "what": "Institutions after the officer and shopkeeper die",
+    "value": "4 days: 30 crimes, 0 decisions with a report or case option, 0 cases, 0 store purchases",
+    "how": "scratchpad/succession.ts: fake JEV, seed 7, set Odile and Sable dead at tick 5"
+   },
+   {
+    "what": "Collective building after the footbridge is done",
+    "value": "Finished at ticks 1606/1901/1141 in 3 of 5 seeds; afterwards 0 of 551 decisions offered any build option",
+    "how": "social-audit.ts, fake JEV, 7 days per seed"
+   },
+   {
+    "what": "Paid versus volunteer bridge work (real JEV)",
+    "value": "The paid carpenter Wren did 6 of 7 and 5 of 9 sessions; volunteers did 1-2 each",
+    "how": "world.project.contributors at tick 221 of the two real replays"
+   },
+   {
+    "what": "Option count and state size per decision",
+    "value": "Options mean 29.4, p95 36, max 52 (schema cap 64); noticing lines mean 16, max 27 (cap 32); state text mean 3429 chars, p95 4069",
+    "how": "social-audit.ts using buildJevCall(toWire(...)) on every decide request"
+   },
+   {
+    "what": "Engine cost versus population",
+    "value": "0.22 ms/tick at 15 agents, 0.40 at 30, 0.90 at 60, 2.02 at 120; 15-16 JEV calls per agent per sim-day",
+    "how": "scratchpad/scale.ts: cloned agents into homes, 576 ticks each, fake JEV"
+   },
+   {
+    "what": "Real JEV cost and latency",
+    "value": "About $0.0001 per call; 334-387 calls ($0.033-0.037) per sim-day for 15 agents; latency median 250 ms, p90 about 2.4 s",
+    "how": "Summed costUsd and latencyMs over the answer events in the two fernhollow lab records"
+   },
+   {
+    "what": "Replay determinism of the latest lab records at HEAD",
+    "value": "First desync at tick 233 of 288 (48 desyncs) and at tick 222 (88 desyncs); identical on the working tree. The records were made about 1 minute before commit 48f19da, so a last-minute code edit may explain it",
+    "how": "scratchpad/desync-find.ts replaying both records against git archive HEAD and against a working-tree snapshot"
+   }
+  ],
+  "quick_wins": [
+   "Let canApproach accept a target in the same building as the asker (engine.ts:879-881; reuse canSee), and stop the chase at engine.ts:2200 from giving up in that case. The Lantern, diner and chapel become places where people actually interact.",
+   "Until the whom-choice lands, offer give, lend, plea and pickpocket to each of the 3 approachable people instead of only approachable[0] (engine.ts:1281). Watch the 64-option cap: the measured max is 52.",
+   "Show each person's favours balance in the feelings lines (engine.ts:1007-1014, from World.favors, which is written at 291-296 but read only by metrics), so reciprocity can be reasoned about beyond the ~5-hour memory window.",
+   "Replace the Crier's headline regex (engine.ts:563-579) with a JEV choice by the journalist over her last 6 newsworthy memories, so the town's only broadcast channel is a person's decision.",
+   "Add social-structure metrics now to get a baseline before any new primitive: share of pairs who ever interacted, concentration of interaction on the top pairs, clustering coefficient and modularity of the liking graph (liking >= 0.35), and reciprocity per pair.",
+   "Count ticks with a vacant institution (no living officer, store keeper absent all day) as a metric, so the measured collapse of institutions after a murder shows up on the metric strip.",
+   "Add a CI test that replays a committed fixture record and asserts desyncs = 0. The two latest lab records desync at ticks 222 and 233 at HEAD, and persisting the world by replaying events depends on exact replay."
+  ]
+ },
+ {
+  "lens": "agent cognition and psychology",
+  "summary": "Fernhollow's villagers have a detailed psyche but very little cognition. Memory is a 14-entry text queue (oldest dropped first) with only the last 7 entries shown to JEV. Each villager has one liking number per person, moved by 23 hard-coded constants. Nothing records who believes what or where they heard it. Emotion does not persist: mood is asked on every call and never read back. There are no intentions: every finished action becomes a fresh choice among about 26 options, while the engine quietly commits villagers to walks and chases that can last hours. Measured: villagers facing someone recall their past with that person less over time (0.68 over 3 days, 0.58 over 10). The other person's relationship line is missing in 38% of reply calls. Salient events drop out of the prompt in about 9 hours. Reflection is keyed to the calendar day, so in the real 15-villager run 5 people reflected twice, once at bedtime and again at midnight, and their next day never gets its own reflection. These gaps block \"destroy someone's house and they will be pissed\", gossip and spreading opinions, targeted revenge or kindness, providing for family, and self-organization. JEV cannot write text, so the right design is structured state rendered into template text, with JEV acting as the rater and chooser: a memory stream scored by importance and relevance where JEV rates importance, relationships and sourced beliefs that JEV updates through feel and believe scores, emotions from appraisal that fade over time, daily intentions chosen from template aims and reconsidered only when something happens, and \"who\" sub-questions so the villager, not proximity, picks the target. Cost is not the constraint (measured at about $0.0001 per call). The data model should land before the persistent live world builds up long-lived state, because the checkpoint loader only fills in missing fields.",
+  "fundamentals": [
+   {
+    "title": "A memory stream scored by importance and relevance (replace the 14-entry queue)",
+    "problem": "A memory is only {tick, text}. It has no kind, no participants, no importance and no event link. The engine keeps 14, drops the oldest first, and shows JEV the last 7. There are 99 remember() call sites and every memory counts the same, so routine lines crowd out salient ones. When a villager is facing someone, the memories JEV sees are the most recent, not the ones about that person. Reflection reads at most the last 10. Over a long-running persistent world this gets steadily worse.",
+    "evidence": "lib/sim/types.ts:308 (MemoryEntry); engine.ts:65-66 (MEMORY_KEEP=14, MEMORY_IN_PROMPT=7), engine.ts:268-271 (push/shift), engine.ts:1005 (slice(-7)), engine.ts:2434 (reflection gets .slice(-10)). Measured with the needs-sensible heuristic: 63% of memories are routine (beat walks, woke up, rest, drink). With the random fake over 3 days: salient memories (attacked, robbed, lied to, death, arrest) stay in the prompt for a median 565 min (p90 810) and in the buffer for a median 730 min. Recall of any non-chat past with the person you are facing: 0.68 over 3 days, 0.58 over 10 days (86/126 and 286/490 reply calls). Real run s600: Odile's memory held 'You walked your beat around town' four times out of 11 entries.",
+    "proposal": "type Memory = { id: string; tick: number; text: string; kind: 'routine'|'social'|'work'|'money'|'kindness'|'wrong_to_you'|'wrong_by_you'|'violence'|'loss'|'news'|'justice'; about: string[] /*agent ids*/; place: string|null; eventId: string|null; importance: number /*0..1*/; formative: boolean; recalled: number }. remember(world, agent, text, {kind, about, eventId}) sets a starting importance from kind (routine .05, social .2, money .4, kindness .5, wrong_to_you .8, violence .9, loss 1.0). For starting importance >= 0.5, the villager's next call carries an extra appraise_<memId> score question ('How hard does this hit {name}?', 5 levels), and importance = EV/4. Keep up to 300 per agent, evicting the lowest-scoring non-formative memory. retrieve(agent, focus, k) scores each memory as 0.995^ageHours + importance + relevance, where relevance is 1 if about overlaps focus.people (people in view, the asker or target, option targets, the current intention's target) and 0.3 if the place matches. The prompt shows 3 formative memories, the top 5 retrieved and the last 4 routine memories, with repeats collapsed ('You walked your beat 4 times this afternoon'). Reply and violence calls set focus to the other person. This is Park et al.'s retrieval, using structured ids instead of embeddings.",
+    "unlocks": "'destroy their house and they are pissed' days later, lasting grudges and gratitude, reciprocity, revenge, and coherent long-running persistent worlds; also the base for beliefs, emotions and reflection insights",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Relationships and sourced beliefs updated by JEV, and chats that carry content",
+    "problem": "Each relationship is one liking number from -1 to 1, changed by fixed constants chosen by the engine, so the engine decides how a villager feels. The 'how you feel about others' section is the top 8 by strength, with no reasons, and it is dominated by the starting relationships. Knowledge of wrongdoing is a list of crime ids that is ground truth, never uncertain or sourced. Chats carry nothing: the only effects are +0.1 liking and a memory line. So opinions cannot spread, there is no reputation, and the three stores (memory text, crime ids, liking) disagree. Example: Mo was offered 'Report Hollis' (she knows crime_8), but her memories and feelings said nothing about Hollis.",
+    "evidence": "types.ts:351 (knows), types.ts:356 (affinity); 23 nudgeAffinity call sites in engine.ts, e.g. :2151 (-0.5 for a noticed pickpocket), :1775 (-0.15 for pantry witnesses), :2578 (+0.1 after a chat), :2977 (-0.3/-0.6 after an attack); engine.ts:1007-1010 (feelings = top 8 by |affinity|); engine.ts:1541 (recordCrime pushes ground truth to knowers); engine.ts:3055 and :2577 (a chat transfers nothing). Measured with the random fake, 3 seeds x 3 days: the asker's feelings line was missing in 98 of 257 reply calls (38%), including 12 of 25 attack replies and 4 of 4 demands to repay. After 3 days, 5.54 of the 8 feelings lines were still at their starting values and 74 of 210 pairs had changed. docs/society-spec.md:541 already says to retire the fixed nudges; it has not been done in lib/sim.",
+    "proposal": "type Tie = { liking: number; trust: number; fear: number; familiarity: number; lastSeen: { tick: number; place: string; doing: string } | null; why: string[] /* top 2 memory ids by importance */ }. type Belief = { id: string; claim: 'took_from'|'hurt'|'killed'|'lied_to'|'destroyed'|'helped'|'owes'|'gouges'|'is_kind'|'is_dangerous'; actorId: string; targetId: string|null; eventId: string|null; source: { kind: 'saw'|'told'|'crier'|'reflection'; fromId?: string }; credence: number; tick: number }. Replace the fixed constants with extra questions on the affected villager's next call: feel_<otherId> scores 'How does {name} feel about {other} now, compared with before?' on 5 levels, and liking += 0.1*(EV-2)*(0.5+importance). trust_<id> works the same way. Chat gains content: the asker answers topic, a choice over up to 4 beliefs with credence >= 0.5 plus small_talk, and the listener answers believe, a 5-level score, which creates a Belief with source told and credence = f(EV, trust in the asker). Lies become false beliefs planted this way. Render each relationship with its reasons: 'Hollis: you dislike him; you saw him pick Juniper's pocket (yesterday); Mo says he cheats (you half believe it).' The person addressing you is always listed first. The knowledge lists become views over Beliefs.",
+    "unlocks": "gossip, spreading opinions, reputation, groups forming around shared beliefs and liking, manipulation and deception of specific people, kindness that is noticed and talked about, and informed revenge or justice",
+    "impact": 5,
+    "cost": "L"
+   },
+   {
+    "title": "Intentions that persist, reconsidered only when something happens (replacing blind engine commitments)",
+    "problem": "Every finished action ends in becomeIdle and a fresh choice among about 26 options, so nothing carries over from one decision to the next. A shift is re-decided every hour and competes each time with 25 alternatives. The life goal is only a sentence in the psyche section, with no steps toward it. At the same time, the engine commits villagers without asking them: a chase lasts up to 50 ticks, and walks cannot be interrupted, so villagers cannot react to what happens on the way.",
+    "evidence": "engine.ts:2043 (finishActing then becomeIdle); engine.ts:97 (work = TICKS_PER_HOUR, one decision per hour); engine.ts:995-996 (goal is just a psyche line); engine.ts:63 and :2215 (CHASE_GIVE_UP_TICKS=50). Real run fernhollow-founders-s600-20260923233212 (raw events): 268 decisions with a mean top-option probability of 0.49 (25.8 options on average in the replay), so each hour is effectively re-rolled. Replay trace: Odile (police officer, shift 8 am to 8 pm) picked talk_tomas at 7:55 and chased him until 11:15 (40 ticks) without being asked again, missing 3h20m of her shift. Needs-sensible heuristic over 3 days: 74% of awake ticks spent moving, median trip 21 tiles (105 in-game minutes), only 4 chats. Shift attendance in the real runs was 0.36 to 0.40.",
+    "proposal": "type Intention = { id: string; aim: AimKey; targetId?: string; steps: Intent[]; step: number; since: number; until: number; why: string|null /* memory or belief id */; shared: string[] }; agent.intention: Intention|null. A new plan call runs on waking and whenever an intention finishes or fails. It asks aim, a choice over up to 20 aims built from templates using affordances, the life goal and current beliefs ('Work your full shift at the clinic', 'Get even with Hollis for what he did', 'Finish the footbridge with Wren', 'Put food on the table for Pip', 'Keep to yourself today', 'Find someone to court'), and until, a score over time horizons. Each later decide shows 'Your plan: {aim} (step 2 of 3, since 8 am)' and a first option continue_plan that shows the next step, but the villager can still choose something else. Work becomes a single intent that runs until the shift ends. The engine emits typed interrupts: being attacked or addressed, a crime within witness range, being named in the Crier, the body alarm crossing a threshold, a chase target going inside, a plan step becoming impossible, or someone important coming into view. An interrupt triggers a cheap reconsider yes/no call: '{name} is {doing}. {interrupt}. Does {name} stop?' Chases reconsider every 12 ticks instead of the fixed give-up. A new recruit offer ('Wren asks you to help build the footbridge this afternoon') adds the listener to shared on acceptance.",
+    "unlocks": "multi-step behaviour for purpose, building and providing for family, revenge plans, self-organization through shared intentions, reactions to events, and fewer routine calls",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Emotions from appraisal that persist and fade",
+    "problem": "Emotion has no state. Mood is asked on every call and written to agent.mood, but perception and physics never read it; only the UI and the digest do. Grief is recorded in a list nobody reads. The engine assigns grief by rule and applies a one-time -20 to social and fun. Anger is folded into the liking number, and fear, shame, guilt and pride do not exist. JEV therefore re-infers each villager's mood from scratch on every call, mainly from the needs text.",
+    "evidence": "lib/jev/prompt.ts:103-117, :348, :390 (mood asked in decide, reflect and violence calls); engine.ts:2677, :3138 (agent.mood written, with no read in perceive, engine.ts:903-1017); engine.ts:1580-1585 (engine-assigned grief), types.ts:353 (grieving, write-only). Across all 9 recorded real runs with motive readouts there is no 'grievance' motive at all.",
+    "proposal": "type Emotion = { kind: 'anger'|'fear'|'grief'|'shame'|'guilt'|'pride'|'gratitude'|'joy'; towardId: string|null; intensity: number /*0..1*/; since: number; memoryId: string }. It is created by an extra appraise question on the affected villager's next call, for memories with importance >= 0.5: emotion, a choice over the kinds that fit the event, and intensity, a 5-level score. Intensity fades exponentially with a half-life set by the psyche: high neuroticism slows the fading of fear and anger, high agreeableness speeds up the fading of anger, and grief has a base half-life of about 7 days. Perception gets a new section, 'How you feel inside', with at most 4 lines ('You are still angry at Hollis for picking your pocket (since yesterday morning)'). Emotions adjust needRates (grief multiplies the social and fun drain by 1.5; fear makes security matter more), which stays within the rule that psychology works only through words, rates and consequences. Either drop mood from decide or keep it only as a measurement.",
+    "unlocks": "'that person is going to be pissed', grief after a murder, guilt and shame after a crime, pride after building, and revenge or kindness driven by emotion that differs by psyche",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Reflect once per sleep cycle, not per calendar day, and store insights",
+    "problem": "Reflection fires on any sleeping tick where the calendar day has changed since the last one. Sleeping across midnight therefore triggers a second reflection at 0:00, and a daytime nap uses up that day's reflection early. The helpers and wrongers lists reset at midnight, so a reflection after midnight never sees them. The drift cap is also per calendar day, so a double reflection gets two caps. Reflection outputs are menus (change, goal) plus grudge or gratitude over today's wrongers only. It stores no conclusion about anyone, unlike Park et al.'s reflection, which writes insights back into memory.",
+    "evidence": "engine.ts:2584-2585 (lastReflectDay !== today), engine.ts:2486 (today reset at midnight), engine.ts:2434 (memories from the same day or the last 144 ticks, last 10), drift.ts:40-43 (daily cap by calendar day). Real run fernhollow-founders-s600-20260923233212, 15 agents, one night: 17 reflections, 6 of them exactly at day 2, 0:00. Five agents reflected twice (Ivy at 21:10 and 0:00, Wren at 23:00 and 0:00, Sable at 23:15 and 0:00, Pip at 20:00 and 0:00, Bram at 22:00 and 0:00). Needs-sensible heuristic over 3 days: 45 reflections at times from 0:00 to 13:05; the midnight ones had 0 memories from that day. drift-models-engine-habits: reflections at 9:25, 12:15 and 14:25 (naps).",
+    "proposal": "Replace lastReflectDay with lastReflectTick. Reflect on the first sleep that starts at least 16 hours after the last reflection, or after 7 pm. The payload is memories since lastReflectTick ranked by importance, not the last 10. Helpers and wrongers cover the period since the last reflection instead of resetting at midnight. Add insight_<personId> for the 2 people with the highest importance today: a choice over template conclusions ('{X} cannot be trusted', '{X} is a true friend', '{X} takes advantage of people', '{X} is dangerous', 'nothing new about {X}'). It creates a Belief with source reflection and a memory that can become formative. Add forgive, a choice over existing grudges plus nobody (already in the spec).",
+    "unlocks": "correct evolution of traits and drift, grudges and forgiveness that build up over days, and the higher-level opinions that let groups and reputations form",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Let villagers choose whom: 'who' sub-questions instead of proximity targeting",
+    "problem": "The engine picks every social target. Only the 3 nearest people can be chatted with. Every gift, loan, request, lie and pickpocket goes only to the single nearest person. Violence is offered only against the lowest-liked adult within 8 tiles, and killing only if there is a grudge or liking is at or below -0.4. When a victim flees, the engine sends them home with a 'stock the pantry' intent. As a result a villager cannot provide for a loved one who is not the closest person, and cannot target a specific enemy.",
+    "evidence": "engine.ts:69 (TALK_OPTIONS=3), :1257-1260 (the nearest approachable people), :1281 (const nearest = approachable[0] receives every transactional offer), :1441 (foe = lowest liking within 8), :1460 (kill gate), :2985 (flee sends the victim to stock_home). Captured state (seed 31, Mo at 8:45 pm day 2): all 5 transactional options (give coins, ask, lend, high-interest loan, pickpocket) targeted Tomas, the nearest; her brother Pip ('very fond') could not be chosen.",
+    "proposal": "Options become verbs without targets ('Give someone 2 coins', 'Go talk with someone', 'Ask someone for food', 'Pick someone's pocket', 'Confront someone'). Each verb family gets a conditional who_<verb> choice over up to 12 known people (p_<id>: 'Pip, your brother; you are very fond of him; at home, 40 steps away'), answered in the same call and applied only if that verb is picked. This generalizes who_news from docs/society-spec.md section 6.2. The engine filters only for feasibility (alive, reachable, no violence against children). A victim who flees also answers a refuge choice: home, the police station, or the busy plaza. The added prompt size is small at about $0.0001 per call.",
+    "unlocks": "providing for family, targeted kindness and charity, targeted revenge, favouritism, and manipulating a particular person",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Perception ordered by salience and split into sections, before adding more villagers",
+    "problem": "'What you notice' is one flat list capped at 32 lines. Every visible villager comes first, then places, and the lines that matter most for the current call (debts, 'X just walked up to you') come last, so they are the first to be cut. Every visible villager is described in detail whether or not they matter to this person, so there is no attention. More villagers and children will break reply calls silently.",
+    "evidence": "engine.ts:1002 (noticing.slice(0, 32)); engine.ts:906-914 (people first). Measured by adding cloned villagers into view: with 24 visible, the debt line and the 'just walked up to you' line were dropped; with 34 visible, the home-pantry line was dropped too. With today's 15 villagers: 25 lines. Random fake, seed 31, 3 days: median state 3,402 characters plus 4,292 characters of options, about 1,924 tokens per decide.",
+    "proposal": "Split perception into sections, each with its own cap and ordering. situation: never truncated, specific to the call (who addressed you, what they want, the stakes, your debts to or from them). people: ranked by |liking| + highest belief importance + active emotion + a proximity term + whether they are addressing you, capped at 8, then 'and 14 others around the plaza'. places: only those relevant to current needs, the intention or beliefs. Option lists get the same relevance cap but always keep options involving the person addressing you and the current intention.",
+    "unlocks": "more villagers, population growth and reproduction, and crowded events such as funerals, fights and markets, without reply calls losing their context",
+    "impact": 3,
+    "cost": "S"
+   },
+   {
+    "title": "World time should wait for villagers' decisions instead of running on network time",
+    "problem": "The live clock advances every 260 ms whether or not JEV has answered. A slow answer leaves the villager frozen 'thinking' for many ticks, and the answer is then applied to a world that has moved on, because perception was built when the request was sent. The lab instead waits for answers, landing each one a fixed number of ticks after its request (--think), so live and lab runs are systematically different minds. A persistent live world will also behave differently depending on network conditions.",
+    "evidence": "components/sandbox/use-sandbox.ts:18 (BASE_TICK_MS=260), :266-275 (ticks advance without checking pending requests); scripts/lab.ts:86-91 (answers land 'think' ticks after the request). Real latency from the recorded lab runs: median 256 ms, p90 2,397 ms, max 6,758 ms. Derived: a p90 answer freezes a villager for about 9 ticks (45 in-game minutes) at 1x and about 36 ticks at 4x.",
+    "proposal": "Use logical time in the live driver: the world advances tick N only when every request issued at or before N - think has been answered or has failed, exactly as the lab does, and the renderer smooths the motion. Combined with interrupt-driven reconsideration (the intentions item above), decisions then happen when events occur rather than at the pace of the network. This complements the persistence work already in flight rather than replacing it.",
+    "unlocks": "live runs equal lab and replay runs, trustworthy experiments on the persistent world, and decision timing that reflects the character rather than the network",
+    "impact": 3,
+    "cost": "S"
+   },
+   {
+    "title": "Make personality drift visible to JEV",
+    "problem": "psycheLines names a Big Five trait only above 66 or below 34, foundations only above 70 or below 30, and values only by their top-3 order. Most drift is therefore invisible to JEV and then flips all at once; whether a change shows up depends on how close the villager started to a threshold. Children render almost nothing. The shadow line states 'you will not be caught' as if it were a fact about the world. Joining with 'and' makes lines hard to parse ('achievement and doing well and safety and stability').",
+    "evidence": "psyche.ts:131 (thresholds), :160 (shadow wording), :124 (joining with 'and'). Measured by applying the same reflection outcome every night until any word changed: Hazel, Mo and Linnea change after 1 night for several outcomes; under more_ruthless, Odile, Sable, Lark, Kit and Tansy show no change after 30 nights, and under closer_to_family Ivy and Mo show none after 30. Kit (a child) renders 2 lines.",
+    "proposal": "Add one line, 'How you have been changing', built from agent.drift: the last 1 or 2 reflection changes with their cause and when they started ('Lately you have grown more wary of people, since Pip lied to you on Tuesday'). Add graded wording for 55 to 65 and 35 to 45 ('somewhat outgoing'). Apply the spec's render-v2 fixes (semicolon joins, 'when you think you can get away with it'). Bump PSYCHE_RENDER_VERSION because this is an experimental change.",
+    "unlocks": "traits that visibly evolve from behaviour, changing course after a formative event, and different psychologies producing different paths over time",
+    "impact": 3,
+    "cost": "S"
+   }
+  ],
+  "measurements": [
+   {
+    "what": "Real JEV cost per call",
+    "value": "$0.0000999 per call ($0.0334 for 334 calls, 1 in-game day, 15 villagers). Derived: at 1x (260 ms per tick) one in-game day is 75 s of real time, so about $1.6 per hour of open browser at 1x and about $6.4 at 4x",
+    "how": "Read meta.costUsd and meta.calls from runs/fernhollow-founders-s600-20260923233212.json.gz; tick length from use-sandbox.ts:18"
+   },
+   {
+    "what": "Real JEV latency",
+    "value": "Median 256 ms, p90 2,397 ms, max 6,758 ms (drift-models run: median 299, p90 2,489)",
+    "how": "latencyMs of the answer events in the two recorded runs"
+   },
+   {
+    "what": "Reflection timing bug (real JEV)",
+    "value": "17 reflections for 15 villagers in one night; 6 exactly at 0:00; 5 villagers reflected twice (bedtime and midnight)",
+    "how": "Answer events containing 'meaning' in the fernhollow s600 run, plus a replay against a HEAD snapshot in the scratchpad before the first desync (tick 233)"
+   },
+   {
+    "what": "Engine-imposed commitment (real JEV)",
+    "value": "Odile chased Tomas for 40 ticks (7:55 to 11:15) after one talk_tomas pick, during her 8 am to 8 pm shift",
+    "how": "Per-tick status trace of the fernhollow s600 replay on the HEAD snapshot"
+   },
+   {
+    "what": "How spread out JEV's choices are (real)",
+    "value": "Mean top-option probability 0.49 over 268 decides; 25.8 options on average; about 2.2 bits of entropy",
+    "how": "Raw action probabilities in the recorded events, plus DecisionRecords from the replay"
+   },
+   {
+    "what": "Share of awake time spent moving",
+    "value": "74% of awake ticks moving, 21% acting, 0.5% chatting; median trip 21 tiles (105 in-game minutes), p90 50, max 81",
+    "how": "scratchpad/sensible.ts, a needs-sensible heuristic in place of JEV, seed 31, 864 ticks"
+   },
+   {
+    "what": "Share of routine memories",
+    "value": "63% routine; about 8 memories per villager per day",
+    "how": "scratchpad/sensible.ts, regex over new memory entries"
+   },
+   {
+    "what": "How long salient memories last",
+    "value": "In the prompt: median 565 min (p90 810); in the buffer: median 730 min (p90 1,540); 58 salient memories",
+    "how": "scratchpad/cog.ts with the random fake JEV, seed 31, 3 days, tracking each memory object"
+   },
+   {
+    "what": "Recall of past history with the person you are facing",
+    "value": "0.68 over 3 days (86/126), 0.58 over 10 days (286/490)",
+    "how": "scratchpad/recall.ts, seeds 31 to 33: reply calls where the responder had non-chat memories naming the asker, checking whether any appeared in perception.memories"
+   },
+   {
+    "what": "Asker's relationship line missing from reply calls",
+    "value": "98 of 257 (38%); attacks 12 of 25; demands to repay 4 of 4",
+    "how": "scratchpad/asker.ts, seeds 31 to 33, 864 ticks each"
+   },
+   {
+    "what": "Attention cap",
+    "value": "24 visible villagers: debt line and 'just walked up' line dropped; 34 visible: home-pantry line dropped too; 15 today: 25 lines",
+    "how": "scratchpad/attn.ts: cloned villagers placed at the fountain, then called the exported perceive()"
+   },
+   {
+    "what": "Prompt size per decide",
+    "value": "Median 3,402 characters of state plus 4,292 of options (about 1,924 tokens); median 30 options, max 46",
+    "how": "scratchpad/cog.ts, buildJevCall(toWire(...)) on every decide, random fake, seed 31, 3 days"
+   },
+   {
+    "what": "Relationships stuck at starting values",
+    "value": "After 3 days, 5.54 of the 8 feelings lines were still at their starting values; 74 of 210 pairs had changed",
+    "how": "scratchpad/cog.ts, comparing affinity with foundingAffinity()"
+   },
+   {
+    "what": "Nights of identical reflection before any psyche word changes",
+    "value": "From 1 night (villagers near a threshold) to more than 30 (e.g. more_ruthless for Odile, Sable, Lark, Kit and Tansy)",
+    "how": "scratchpad/drift.ts: applied reflectDrift once per day, then compared psycheLines output"
+   },
+   {
+    "what": "Engine computation speed",
+    "value": "0.19 ms per tick; building every JEV call (about 600 calls) took 9 ms in total, so the engine is not the bottleneck, JEV latency is",
+    "how": "scripts/probe.ts 31 864 and timing inside scratchpad/cog.ts"
+   },
+   {
+    "what": "Negative motives in real runs",
+    "value": "0 'grievance' motive readouts across all 9 recorded runs with motives",
+    "how": "scratchpad/head/scripts/raw.ts, tallying answers.motive.choice"
+   }
+  ],
+  "quick_wins": [
+   "Fix the reflection trigger (engine.ts:2584): store lastReflectTick, reflect on the first sleep that starts after 7 pm or at least 16 hours after the last reflection, and reset agent.today at reflection instead of midnight (engine.ts:2486).",
+   "In reply and violence calls, always put the other person's relationship line first in the feelings section, along with any memory naming them. This is a sort change in perceive(askedBy) and fixes the 38% miss.",
+   "Move the call-specific lines ('X just walked up to you', debts with that person) to the top of 'What you notice' so the 32-line cap cannot cut them (engine.ts:1002).",
+   "Collapse repeated routine memories ('You walked your beat around town' x4 becomes 'You walked your beat 4 times this afternoon') so the 7-line window keeps salient events.",
+   "Replace the fixed 50-tick chase give-up (engine.ts:63, :2215) with a yes/no 'keep looking for X?' question every 12 ticks, or at least cap chases at 12 ticks.",
+   "Either feed agent.mood back into perception ('Lately you have been feeling low') or stop asking mood on every decide; today it is write-only.",
+   "Replace flee sending the victim to stock_home (engine.ts:2985) with a flee-to-safety intent, and record that the victim fled.",
+   "psyche.ts:160: change 'and you will not be caught' to 'when you think you can get away with it'; join trait phrases with semicolons (the spec's render-v2 fixes); bump PSYCHE_RENDER_VERSION.",
+   "Movement is 1 tile per 5-minute tick, so the median trip takes 105 in-game minutes and 74% of awake time is spent walking. Two or three tiles per tick would give villagers time to meet and interact (a physics change, but it drives how often they decide).",
+   "Before long-lived state builds up in the persistent world, land the cognition data model (Memory kind and importance, Tie, Belief, Intention). hydrateWorld in lib/sim/checkpoint.ts only fills in missing fields and deliberately skips affinity, so moving from affinity to Tie later needs an explicit migration."
+  ]
+ },
+ {
+  "lens": "economy and game theory",
+  "summary": "Fernhollow has coins, shops and payroll, but no economy in the game-theoretic sense. Money cannot change what a villager survives on, owns or builds, and the one exploit on offer (gouging) pays the gouger nothing, because shop tills belong to nobody. Coins are conserved but flow one way: county grant -> treasury -> wage earners -> tills -> delivery truck. Every till hit zero by day 2 to 4 under every policy I ran. That kills the farmer's only market, while food and idle money pile up in different houses. Food is not scarce: the free berry commons alone covers about 96% of the town's hunger, and total capacity is about 3x demand. So in real JEV runs the poorest villager never fished diligently, nobody collapsed, and about one work hour a day satisfies purpose. The repeated game has a short memory (memories last about 17 to 30 hours, and the favours ledger never reaches JEV), so cooperation and defection are effectively one-shot. Smallest fixes, in order: give each business an owner (till -> owner), make food a scarce, perishable flow, add person-to-person trade with JEV-chosen terms, then a per-pair ledger, property and capital, labor contracts, and fiscal decisions.",
+  "fundamentals": [
+   {
+    "title": "Businesses belong to nobody: the till is a one-way sink, so trade, gouging and self-employment pay nothing",
+    "problem": "Shop.till is business money kept apart from the keeper's own purse, and no code path ever moves till coins into a purse. The till pays only the delivery truck, local producers and sales tax. Sable, Mo and Lark therefore have zero income by construction, yet their perception says 'You live on what you sell', and the gouging option promises 'you keep the difference'. The exploit is fake, so the price choice has no stakes and cooperative versus exploitative pricing is not a real dilemma. JEV clearly wants to gouge: it puts real probability on the high price.",
+    "evidence": "lib/sim/types.ts:116 ('Business money, separate from the keeper's own purse'). Every till write (engine.ts:1801, 1817, 1833, 2385-2388, 2396-2397, found by grep) credits the truck, a producer or the treasury, never a keeper. False claims at engine.ts:924 and engine.ts:1169. Measured with a heuristic policy over 7 days: Sable ends at 274 coins whether the price is 3, 4 or 7, while the other villagers end at 947, 934 and 856 (gouging moves about 78 coins into a till that only pays the truck). Over 14 days Mo went 80 -> 56 and Lark 85 -> 47 while working. Real JEV (runs/fernhollow-founders-s600-20260923233212, replayed before the first desync at tick 233): Sable put p=0.09-0.20 on price_high and 0.00 on fair and cheap in all 7 decisions he made inside the store.",
+    "proposal": "Add ownerId to Shop (sable, mo, lark) and treat the till as the owner's business account. Minimal version, a few lines in townDay: at the 6 pm close, profit above a 20-coin float moves to the owner's purse, with a memory line 'You took home N coins from the till'. Add own-store intents deposit_till and withdraw_till (the spec 2.3 verbs fetch_from_own_store and stock_own_store), offered only inside your own shop. Show the owner the till, today's revenue, cost of goods and margin. Fix the two false texts. Gouging then raises the owner's purse and customers' resentment, which is a live dilemma.",
+    "unlocks": "buy/sell/exploit with real payoffs; market power; charity pricing that costs the giver; self-employed labor incentives; the spec's role-versus-person pricing experiment",
+    "impact": 5,
+    "cost": "S"
+   },
+   {
+    "title": "No scarcity: a free commons covers about 96% of food demand and capacity is about 3x demand",
+    "problem": "Coins are optional for survival, so nobody is forced into trade-offs. Working, charity, food theft and hoarding have almost no material consequence. Nothing spoils, so surpluses pile up forever. The option text also misstates physics: it says berries only take the edge off hunger, but a berry equals a cooked meal.",
+    "evidence": "6 bushes x 1 berry per 60 ticks (engine.ts:61) = 28.8 berries a day. One berry eaten on the spot gives 3 ticks x +12 = +36 hunger (engine.ts:2300), the same as cook_home at 6 x +6 (engine.ts:2306), against the text at engine.ts:1049. Town hunger drain is about 1080 a day (0.3 per tick awake, x0.35 asleep, persona multipliers), or 30 portions. Capacity is about 100 portions a day (berries 29 + farm 24 + fish 12 + truck 20 + diner 15). There is no spoilage code anywhere in lib/sim. In a 14-day heuristic run, home food rose 30 -> 283 portions (all in the Harrow and Reed houses) with 0 collapses. Real JEV: Hollis (2 coins) put 0.00 on work_diligent in all 12 pre-desync decisions where it was offered and fished only by coasting (twice); both Fernhollow runs had 0 collapses. Pip, the farmer, spent 24 of his 30 coins buying store groceries after stocking his own produce at home.",
+    "proposal": "(a) Replace the integer carry, homeFood and stock with FoodStack {kind, n, madeTick}, using the spec 2.3 shelf lives (berries 2 days, fish 1, produce 3, groceries 5) and a spoiled counter. (b) Make berries a visible, depletable commons: regrow 1 per 240 ticks (about 7 a day, 25% of demand), with perception stating how many are left. That makes 'gather to carry' against 'leave some for others' a real dilemma. (c) Make the option text match the physics. (d) Add a calibration test with a needs-greedy policy: if everyone works, nobody spends more than 1 hour a day below hunger 15; if the producers shirk, someone does. Target supply at 1.1-1.3x demand.",
+    "unlocks": "real trade-offs; providing for family; charity and food theft with consequences; the commons dilemma; famine interventions that bite",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "No trade between villagers, and every amount is fixed",
+    "problem": "The Offer union has gifts, pleas, loans and pickpocketing, but no exchange. Producers can sell only to the store, which buys only while its till can pay. Once the till empties (day 2 to 4), the farmer and fisher have no market, and food and money sit in different houses with no way to meet. Every amount is hard-coded (gift 2 coins, loan 5 -> 6 or 5 -> 9, prices 3/4/7, pickpocket up to 3), so JEV cannot express how generous or how greedy someone is, or haggle.",
+    "evidence": "types.ts Offer union. engine.ts:1147 (sell requires store.till >= buyPrice). Fixed amounts at engine.ts:1297, 1323, 1330, 1160-1180 and 78 (PICKPOCKET_MAX). In the 14-day heuristic run, 283 portions sat in 2 houses while Bram, Tomas and Mo spent 430-595 ticks below hunger 25 walking to the woods, and 1646 private coins sat idle. Decide calls carry a median of 29 options (p95 34, max 37) against the wire cap of 64 (schema.ts:69), so terms cannot be added as extra options.",
+    "proposal": "Add Offer {kind:'trade', give:{food?|coins?|assetId?}, get:{...}}. Add the options 'Offer to sell food to X' and 'Offer to buy food from X' for the 1 to 3 nearest people (the existing TALK_OPTIONS). Terms go in a side question inside the same decide call, not in the option list: terms_<optionId> is a choice over about 6 honestly labelled price tiers ('1 coin a portion, below what the store pays' up to '8 coins, twice the store price'). It is asked only for the trade options present and used only if that option wins. The responder chooses accept, counter (one tier their way, which triggers one more respond from the asker) or refuse. The same tier mechanism sets gift and loan amounts. This is an ultimatum and bargaining game that can be measured per psyche.",
+    "unlocks": "buying and selling between people; manipulation (overcharging the desperate); kindness (selling below cost); haggling; measurable generosity; self-organizing trade networks",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Wealth buys nothing that lasts: no property, tools or capital to build, own, steal or destroy",
+    "problem": "Coins can be spent only on three consumables, or given away and lent. So the 'grow rich' goal means nothing, inequality has no effect on anyone's options, there is no investment-versus-consumption trade-off, and apart from the footbridge there is nothing to build, rearrange or destroy. Claudio's 'destroy someone's house and they are pissed' has no object to act on.",
+    "evidence": "The only villager coin sinks are at engine.ts:1117-1153 (dine, bar, buy). Agent holds only coins and carry (types.ts Agent). The wealth goal exists in lib/jev/schema.ts GOALS. In the 14-day heuristic run, Sable held 274-280 coins with nothing to buy, Odile went 60 -> 215 and Hazel 150 -> 210. In real JEV, Sable spent 6 of 280 coins, on one meal. The spec covers home deeds (spec 2.5) but no capital goods.",
+    "proposal": "Add Asset {id, kind: 'tool'|'cart'|'boat'|'stall'|'field_plot'|'house_upgrade'|'fence', ownerId, pos?, condition 0-100, value, builtBy[]} and World.assets. Effects: a rod multiplies fish x1.5, a plough multiplies produce x1.5, a cart raises carry from 6 to 12, and a house upgrade adds respect and a visible sprite. Wren builds assets from wood (east woods, 1 an hour; spec Slice B) plus hours, and they change hands through the trade offer. New verbs: damage and destroy (a crime against the owner, feeding wrongedBy and a new life event 'property_destroyed'), repair, and inheritance by the household. First slice: Wren's workshop sells a rod and a plough.",
+    "unlocks": "building things; destroying someone's property with lasting grievance; investment versus consumption; inheritance; envy and inequality that matter; the carpenter as a real business",
+    "impact": 5,
+    "cost": "L"
+   },
+   {
+    "title": "The repeated game has a short memory and no reputation",
+    "problem": "Villagers rarely act on a partner's track record because the prompt rarely carries it. Memory holds 14 entries and shows 7. The favours ledger is written but never shown. A lender sees no credit history. Third parties learn about a default or a theft only by seeing it or reading the Crier. The shadow of the future is weak, so cooperation-versus-defection choices behave like one-shot games and tit-for-tat cannot emerge.",
+    "evidence": "engine.ts:65-66 (MEMORY_KEEP 14, MEMORY_IN_PROMPT 7). Median memory lifetime before eviction is 17.3 h under the fake JEV (p90 23.4 h) and 29.5 h under the heuristic (p90 42.8 h). Across 90 non-chat replies (fake JEV, 5 days), the responder's prompt named the asker in memories 38% of the time, with a feelings line 52% of the time; for loan, plea and demand replies it was 35%. world.favors is written at engine.ts:295 and never read into perception. The loan options (engine.ts:1323-1333) say only that the borrower may or may not pay you back.",
+    "proposal": "Add World.ledger: Record<'a>b', {gave, got, lent, repaid, defaulted, theftsKnown, liesKnown, tradesFair, tradesGouged, lastTick}>, updated at the existing helpedBy, wrongedBy, debt and trade call sites. Render one line for each person named in the options (asker, target, trade partner), for example 'History with Pip: he repaid 2 of 2 loans and gave you food once; you owe him nothing' (the spec's M26 wording, planned for Slice B). Reputation: Agent.heard holds fact ids per person, spread by witnessing, a gossip offer in chat and the Crier, and shown as 'What you have heard about X'. New metric, conditional cooperation: P(help X | X helped you) - P(help X | X wronged you). Watch the budget: noticing currently peaks at 26 of 32 lines.",
+    "unlocks": "tit-for-tat; trust; credit markets; reputational punishment of gougers and defaulters; groups forming around trust; opinions spreading",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Production chains are cut and supply is a fixed standing order",
+    "problem": "The diner and inn buy nothing locally, and meals come only from the truck. The store orders 20 units a day whatever is already on the shelf, and nobody decides inventory. So there is no farm -> store/diner -> customer chain, local producers never compete with imports, and tills bleed to zero regardless of behaviour. The cook cannot use her own kitchen.",
+    "evidence": "buyPrice 0 for the diner and inn (engine.ts:238-239). Fixed order at engine.ts:85 and 2385-2388. Heuristic run: the store had 51 units on day 1 and the truck still took 60 coins, draining the till 80 -> 2. Shelf stock then sat at 52-68 for 12 days. Real JEV replay: the store till fell 80 -> 42 in one day, with 6 units sold. Stale-meal bug: deliver() returns before resetting meals when the till cannot pay (engine.ts:2386), so a broke diner's meals never perish (stock 6 with a till of 1 for 10 days). Real JEV at 8:45 pm on day 1: Mo, hunger 21, with 10 unsold meals and 60 coins in her diner's till and 80 in her purse, asked two neighbours for food, because she has no verb to eat from her own kitchen.",
+    "proposal": "Give the diner a kitchen with ingredient stock: a meal = 1 ingredient + 6 ticks of the cook's time. When Pip or Hollis offer produce, Mo gets an accept_sale respond (take_all, take_some, refuse; already designed in spec 2.3). The store buys produce and fish at a posted buy price. The truck becomes an order the owner picks at shift start (0, 5, 10 or 20 units at 3 coins). Local produce at 2 undercuts imports at 3, so the local chain wins only while producers actually work.",
+    "unlocks": "a real production economy; interdependence (the cook needs the farmer); boycotts and strikes; shortages with a local cause",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Labor has no material stakes and jobs are permanent",
+    "problem": "About one diligent hour a day refills purpose, pay buys nothing anyone needs, and the self-employed earn nothing at all. Nobody can be hired, dismissed or employ someone else. Observed attendance (36-40%) therefore reflects persona wording, not incentives, and there is no principal-agent game.",
+    "evidence": "Purpose drains 0.1 per tick x rate (engine.ts:55; psyche.ts:183) = 16.5-37.3 a day. Diligent work adds 2.5 per tick for 12 ticks = +30 an hour (engine.ts:2325). So 0.55-1.24 hours a day refills purpose for every villager, against posted shifts of 6-13 hours (jobs.ts). Shirk test over 10 days: Sable ends at 280 shirking against 274-280 working, and Mo at 80 against 56-80, so working never raised their money. Salaried shirkers lost 27-117 coins that buy nothing they need. Real JEV attendance was 0.36 and 0.40. Persona.job is fixed data.",
+    "proposal": "Add Employment {employer: 'town'|agentId, workerId, wage, hoursDue, warnings}. The mayor gets a weekly review duty question per town employee (keep, warn, dock pay, dismiss; spec M6, planned for Slice B), vacancies are posted on the notice board, and anyone can pick an 'apply' option. Private hiring via Offer {kind:'hire', wage tier, hours}: Pip can hire Hollis for field work, and Sable can hire a helper to keep the store open. Taper the purpose gain after 2 hours (x0.5), so duty and money, not purpose, carry a full shift.",
+    "unlocks": "the principal-agent game; exploitation (low wages); kindness (generous wages); unemployment; real jobs; self-organized labor",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Money supply is an open pipe with no fiscal decisions, and a rich villager breaks the wire",
+    "problem": "120 coins enter every day, and the only exit (deliveries) stops once the tills are empty, so money grows without bound. The treasury accumulates and nobody decides anything about it. In a persistent world, the first villager to hold more than 500 coins can no longer answer any offer, because the request fails validation.",
+    "evidence": "engine.ts:83 and 2383-2389. In the 14-day heuristic run, coins_out stayed flat at 118 from day 2 while coins_in reached 1680; the treasury went 600 -> 1749 and private coins 1180 -> 1646. Real JEV day 1: treasury 600 -> 649 and 600 -> 655 (payroll 73 against a 120 grant). The mayor's work only adds respect (finishWork). schema.ts:93 caps can.coins at 500; I verified that a respond wire with can.coins=501 fails jevRequestSchema, which both app/api/jev/route.ts:8 and runJev in lib/jev/call.ts enforce. At 40 coins a day, the doctor reaches 500 in about 2 weeks of full attendance.",
+    "proposal": "Now: clamp can.coins and can.food in startAsking (they only bound the replies) or raise the cap, and add money-stock metrics (private coins, tills, treasury). Then give the mayor a weekly budget duty: a choice of tax tier (0/5/10/20%) and a choice of spending (project materials, relief to the poorest, a bonus for workers, or save), plus a private take_from_treasury option recorded in a readable ledger (designed in spec M6). Add real sinks: imported materials for assets, and clinic supplies. Tune the grant so the money stock stays about flat under the needs-greedy policy.",
+    "unlocks": "institutions; a public-goods game; embezzlement; tax politics; a persistent world that stays stable",
+    "impact": 3,
+    "cost": "S"
+   },
+   {
+    "title": "Economic decisions are buried in the action list with fixed tiers, and shops close whenever the keeper is deciding",
+    "problem": "Setting a price competes with 'work this hour' inside one choice, so min-p sampling never lets a price change through, even when JEV clearly leans toward gouging. Only the store has prices at all; diner and inn prices are hard-coded. And shopOpen requires the keeper to be mid-work, so a keeper standing inside and deciding counts as closed.",
+    "evidence": "Price options appear only while Sable decides inside the store (engine.ts:1157-1180). MIN_P is 0.25 of the favourite (engine.ts pickFrom, around line 2610). Real JEV: price_high at 0.09-0.20 against work_diligent at 0.41-0.94, so it was never sampled, and the price stayed 4 all day in both Fernhollow runs. Diner and inn prices are fixed at engine.ts:238-239. The open check (engine.ts:337-348) requires status acting:work. Traced: Lark reached the general store while Sable was idle inside it and was turned away. found_closed was 262-302 per 14 days in heuristic runs, and 2 and 10 in the two real 1-day runs.",
+    "proposal": "At a role holder's first shift decision each day, add duty side questions to the same decide call: price_<good> (a choice over honestly labelled markup tiers, from the spec 2.3 table), order_<good> and buy_price_<good>. They go in decideQuestions in lib/jev/prompt.ts alongside mood and motive and are applied directly, with no extra call (the spec's C3 set_prices, 'up to 3 price questions in one call'). Count a keeper as serving whenever they are inside their shop during their shift, whatever their status.",
+    "unlocks": "measuring market power per psyche (role versus person); price dynamics; gouging in shortages; economic decisions that are easy to read in the UI",
+    "impact": 3,
+    "cost": "S"
+   }
+  ],
+  "measurements": [
+   {
+    "what": "Engine step cost",
+    "value": "0.15 ms per tick with the fake JEV (2016 ticks, 1136 calls, 296 ms); 0.16-0.19 ms per tick with the heuristic over 14 days; building the wire for one decide takes 0.013 ms",
+    "how": "bun scripts/probe.ts 31 2016; scratchpad/econ/run.ts; scratchpad/econ/options.ts"
+   },
+   {
+    "what": "Decide call size",
+    "value": "median 29 options (p95 34, max 37) against the wire cap of 64; state text median 2733 chars (max 3592); noticing lines peak at 26 of 32",
+    "how": "scratchpad/econ/options.ts and econ/notice.ts over 3-4 in-game days"
+   },
+   {
+    "what": "Real JEV cost",
+    "value": "$0.0334-0.0370 per in-game day for 15 villagers (334-387 calls). A day lasts 75 s at 1x (BASE_TICK_MS 260), so about $1.60-1.78 per wall-clock hour; $2 buys about 55-60 in-game days",
+    "how": "meta.costUsd in runs/fernhollow-founders-s600-*.json.gz; components/sandbox/use-sandbox.ts:18"
+   },
+   {
+    "what": "Coin conservation",
+    "value": "drift 0 on every day for 14 days (total coins = start + coins_in - coins_out)",
+    "how": "scratchpad/econ/run.ts daily ledger"
+   },
+   {
+    "what": "Money growth",
+    "value": "private coins 1180 -> 1646 and treasury 653 -> 1749 over 14 days; coins_out flat at 118 from day 2 while coins_in reached 1680",
+    "how": "scratchpad/econ/run.ts workers 14 sell=1 (heuristic all-work policy)"
+   },
+   {
+    "what": "Tills drain to zero",
+    "value": "store till 80 -> 2 at the first delivery (day 2, 7 am) with 51 units already on the shelf; diner 30 -> 0; inn 40 -> 0 by day 3. With a spending policy, the store till reached 0 by day 4",
+    "how": "scratchpad/econ/run.ts, workers and spenders variants"
+   },
+   {
+    "what": "Food balance",
+    "value": "demand about 1080 hunger a day (30 portions); free berries supply 28.8 a day = 96% of demand; total capacity about 100 portions a day; home food piled up 30 -> 283 in 2 households over 14 days",
+    "how": "scratchpad/econ/food.ts (analytic from the engine constants) plus the run.ts ledger"
+   },
+   {
+    "what": "Gouging payoff to the shopkeeper",
+    "value": "Sable ends with 274 coins at price 3, 4 and 7 alike (7 days); the other villagers end with 947, 934 and 856",
+    "how": "scratchpad/econ/gouge.ts"
+   },
+   {
+    "what": "Real JEV pricing intent",
+    "value": "Sable: price_high p=0.09-0.20 and fair/cheap 0.00 in all 7 in-store decisions; never sampled because work_diligent was 0.41-0.94 and min-p is 0.25",
+    "how": "scratchpad/econ/replay2.ts, a replay of runs/fernhollow-founders-s600-20260923233212 truncated before the first desync at tick 233"
+   },
+   {
+    "what": "Real JEV labor",
+    "value": "Hollis (2 coins): work_diligent 0.00 in all 12 offers, 2 coasted hours only; Pip spent 24 of 30 coins on groceries after stocking his own produce; attendance 0.36 and 0.40; 0 collapses",
+    "how": "scratchpad/econ/replay2.ts plus run meta.final"
+   },
+   {
+    "what": "Hours of work to refill purpose",
+    "value": "0.55-1.24 diligent hours a day for all 15 villagers, against posted shifts of 6-13 h",
+    "how": "scratchpad/econ/purpose.ts (needRates x BASE_DECAY against +30 per diligent hour)"
+   },
+   {
+    "what": "Shirking payoff",
+    "value": "over 10 days, Sable 280 shirking vs 274-280 working and Mo 80 vs 56-80; salaried shirkers lose 27-117 coins that buy nothing they need",
+    "how": "scratchpad/econ/shirk.ts (same seed, all-work world vs 7-shirker world)"
+   },
+   {
+    "what": "Repeated-game memory",
+    "value": "median memory lifetime 17.3 h (fake JEV) and 29.5 h (heuristic); the responder's prompt names the asker in 38% of non-chat replies, and in 35% of loan, plea and demand replies",
+    "how": "scratchpad/econ/memory.ts over 5 days"
+   },
+   {
+    "what": "Wire cap for a persistent world",
+    "value": "a respond wire with can.coins=501 fails jevRequestSchema ('Too big: expected number to be <=500')",
+    "how": "scratchpad/econ/schema-cap.ts"
+   },
+   {
+    "what": "Evidence limit",
+    "value": "the recorded real run replays with 48 desyncs on the current working tree (first at tick 233) because of the in-flight justice edits, so real-JEV decision evidence uses ticks before 233 only",
+    "how": "ReplayCursor.desyncs in scratchpad/econ/replay.ts and replay2.ts"
+   }
+  ],
+  "quick_wins": [
+   "Clamp can.coins and can.food when building a respond request (startAsking) or raise the 500 cap in lib/jev/schema.ts:93 before server persistence ships; otherwise the first villager above 500 coins can never answer an offer.",
+   "Make the prompts honest now: engine.ts:1169 ('you keep the difference') and engine.ts:924 ('You live on what you sell') are false for Sable, Mo and Lark, and engine.ts:1049 understates berries (+36 hunger, the same as a cooked meal).",
+   "Small version of till ownership: in townDay at 6 pm, pay till coins above a 20-coin float into the keeper's purse, with a memory line.",
+   "Make the store's standing order top up to a target shelf, for example max(0, 30 - stock), instead of 20 fixed, so the till stops bleeding when stock is already high.",
+   "Fix the stale-meal bug: in deliver() (engine.ts:2386), set diner meals to 0 before returning early when the till cannot pay.",
+   "Count a keeper as serving while they are inside their own shop during their shift, even while deciding; this removes most found_closed events.",
+   "eat_carry eats 2 portions for +30 (2 ticks, each -1 carry and +15); make it 1 portion so it matches its label.",
+   "Put world.favors into the feelings lines ('Mo has helped you 3 times; you have helped her once'); the data already exists.",
+   "Add economic metrics (private coin stock, tills, treasury, food stocks, spoiled food, conditional cooperation) and a needs_greedy policy in the lab as a calibration gate before JEV spend. The scratch policy at scratchpad/econ/policy.ts is about 80 lines.",
+   "Give the diner and inn price tiers; they are hard-coded at 6 and 2 (engine.ts:238-239)."
+  ]
+ },
+ {
+  "lens": "Longevity of a persistent world, and scientific validity of \"authentic decisions\"",
+  "summary": "The engine is deterministic, but only as long as its own code never changes. A live world that runs for weeks across deploys needs versioned snapshots as its source of truth, and today there are none. None of the 13 recorded runs replays on HEAD. Four of them cannot be replayed on any commit because they were recorded on uncommitted code. The desync counter reports 0 while it applies 93 answers to the wrong villagers. Time compression makes every long-run problem arrive fast: at 1x the world runs 48 in-game days per real hour. In that time trait drift hits its hard cap, the population can only shrink (no births, no aging, no one takes over a dead person's job), and money grows by exactly the county grant whatever anyone does. On validity: position and content are fully confounded (eat is first in 93% of menus and rest is last in 100%). The trajectory is chaotic because of one shared RNG stream: one answer delayed by one tick changes all 15 villagers within 13 in-game hours. Min-p 0.25 quietly halves crime and removes almost all gifts and loans. Some option text promises consequences the engine does not implement. The JEV judge gives the same verdict under every condition. So nothing in the repo can yet tell JEV's psychology apart from our menu design, and the fixes below are what make \"authentic decisions\" a claim you can defend.",
+  "fundamentals": [
+   {
+    "title": "Versioned snapshot chain as the source of truth, with integrity-checked, epoch-scoped event logs",
+    "problem": "Replaying from seed plus events only works on the exact code that recorded it, and nothing records which code that was. RECORD_VERSION stayed 1 across four different engines. RunEvent matches answers to requests only by a global sequence number, so replaying on the wrong code puts answers on the wrong villagers and still reports 0 desyncs. The in-flight checkpoint has three gaps: it is one blob that each save overwrites (no history), it carries no engine or prompt version, and it keeps no events. hydrateWorld only fills in missing keys, so code changes to the map or personas (new buildings, new people, edited personas) never reach a saved world, and new fields arrive with their genesis values. The evidence behind decisions also disappears: STATES_KEPT keeps only 3 state texts per villager.",
+    "evidence": "Measured: replaying all 13 runs/*.json.gz on HEAD gives desyncs up to 638/653 and wrong populations (15 vs 10 or 4). Replaying each run on its own commit (scratch git archive): 6 replay cleanly, psyche-founders-s200 (292/356), economy-v1 (524/622) and both fernhollow runs (88/387, 48/334) desync on every commit. Silent corruption: scarcity-baseline-s100 on HEAD reports desyncs 0 but applies 93 of 105 decide answers to a different 15-person town and logs 43 'Unusable JEV answer ... unknown option talk_juniper'. lib/sim/session.ts:13 RECORD_VERSION = 1, lines 16-27 (RunEvent has no agentId/kind/stateHash). lib/sim/checkpoint.ts:9 CHECKPOINT_VERSION = 1, :17 STATES_KEPT = 3, :79 hydrateWorld (additive fill only). lib/live/store.ts writes one live/<id>.json.gz. Snapshot 970 KB JSON (143 KB gzip), 843 KB of it decisions[].state. Event log about 197 KB per in-game day raw.",
+    "proposal": "(1) lib/sim/version.ts: ENGINE_VERSION (VERCEL_GIT_COMMIT_SHA, or a build-time content hash of lib/sim/** and lib/jev/** in dev); PROMPT_HASH = FNV-1a of buildState and decideQuestions rendered on a fixed fixture perception, so any wording change changes the hash; PSYCHE_RENDER_VERSION. Stamp all three on Checkpoint, RunRecord and every DecisionRecord. (2) Immutable history: live/<id>/cp/<day>.json.gz once per in-game day plus a head pointer, instead of overwriting a single blob. (3) Epoch segments: {fromCheckpointKey, engineVersion, events[]} appended as JSONL chunks. A deploy that changes ENGINE_VERSION closes the segment and writes a boundary checkpoint. ReplayCursor refuses a segment whose engineVersion is not the running code. (4) RunEvent gains agentId, kind and stateHash; any mismatch on apply counts as a desync and stops the replay. (5) Explicit MIGRATIONS: Record<number, (cp) => cp>, plus a fixture test that loads a stored v(n-1) checkpoint and runs invariants. Map and persona changes become migrations, not silent code edits. (6) Content-addressed evidence: store state text once as states/<sha256>.txt in Blob and keep only the hash in the DecisionRecord, so evidence never has to be dropped to keep checkpoints small.",
+    "unlocks": "A fully stateful world that survives reloads and deploys for weeks; being able to audit why something happened on day 40; defensible replays",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Make world time independent of network latency: per-agent RNG streams and a fixed think time",
+    "problem": "Every random draw in the world (wander target, min-p roll, chat and press Bernoulli draws) shares one mulberry32 state on world.rng. Any perturbation therefore spreads chaotically through everyone. In live mode an answer is applied whenever it happens to arrive, so network latency, tab throttling and pause/resume all change history. The lab applies answers after exactly 1 tick, so lab and live are different experimental conditions. Paired A/B runs (same seed, one fact changed) cannot be interpreted.",
+    "evidence": "Measured butterfly test (scratch zz/butterfly.ts, same seed, answers keyed per agent and call so the policy is identical): delaying ONE answer by one tick made 281 of 288 ticks differ, up to 15/15 agents (8/15 by hour 4), with 65 of 90 counters different after one day. The same test on a scratch copy with keyed per-agent RNG (7-line patch of the 4 nextRandom sites at engine.ts:1495, 2624, 3019, 3068): 1 tick differs, 1 agent, 0 counters. Real JEV latency across 4,048 recorded answers: p50 290 ms, p90 2,426 ms, p99 6,656 ms. At BASE_TICK_MS 260 (use-sandbox.ts:18) that is 9 ticks stale at p90 at 1x and 37 ticks at 4x, while the lab uses think=1 (scripts/lab.ts).",
+    "proposal": "Replace world.rng with rand(world, agentId, stream) = hash32(seed, agentId, stream, agent.rngCounters[stream]++). The counters live on Agent, so they are saved in the snapshot. Use streams 'wander', 'choice:<questionId>', 'engage', 'press' and 'shuffle', plus a 'physics' stream per entity for world events. Give every SimRequest dueTick = tick + THINK_TICKS (recorded in WorldConfig, e.g. 3). The driver applies answers exactly at dueTick in request-id order, and holds the world clock if a due answer has not arrived (a stall, not a divergence). History then depends only on (snapshot, answers), so pause, resume, reload and speed changes are invisible and live equals lab.",
+    "unlocks": "Pause when no browser is open and resume later with the same history; A/B experiments and ablations you can interpret; live and lab results being comparable",
+    "impact": 5,
+    "cost": "S"
+   },
+   {
+    "title": "Decision provenance plus a counterfactual re-ask harness (shuffle, reword, psyche swap, one-fact change)",
+    "problem": "Options are always shown in authored order: body first, then work, commons, people, justice, violence, leisure, and rest last. Position and content are therefore fully confounded: any primacy bias JEV has shows up as 'villagers eat sensibly'. Nothing is logged that would let anyone separate the psychology effect from the effects of wording, order or option count. There is no shown order, no prompt version, no eligible set and no stale-ticks record. PSYCHE_RENDER_VERSION is declared and never recorded. The spec (docs/society-spec.md 1793, 2446) plans a seeded shuffle and version logging, but the live code implements none of it.",
+    "evidence": "Real JEV data (1,413 decisions from 5 runs replayed on their own commits, scratch longev/jev_dist.ts and analyze.ts): position 0 was 'eat' in 1,317/1,413 (93%), the last position was 'rest' in 1,413/1,413. The first 40% of positions hold 66.1% of JEV's probability mass while making up 42.3% of options. p_top falls from 0.54 on 9-15 option menus to 0.44 on 24-28 option menus (observational). The current engine has the same order: eat at relative position 0.02, rest at 1.00 (zz/wording.ts). grep: PSYCHE_RENDER_VERSION appears only at lib/sim/psyche.ts:9. Cost per call $0.000085 (mean over recorded answers).",
+    "proposal": "(1) Seeded shuffle of options per call from rand(agent,'shuffle'). Log shownOrder, and keep a fixed order only as an ablation arm. (2) A DecisionLog row per call: {decisionId, tick, agentId, kind, engineVersion, promptHash, stateHash, shownOrder, full probability vector, eligible ids, prunedMass, roll, picked, staleTicks, stillValidAtApply}, written to the segment log. (3) scripts/probe-jev.ts: sample N recorded decisions, rebuild the exact state from the content-addressed store, apply one named perturbation (shuffle, reverse, neutral_details, no_psyche, swap_psyche:<otherId>, drop_option:<verb>, fact:hunger+30, affinity_flip:<id>, action_only with no motive/mood questions), re-ask JEV, and report mean |\u0394p| and argmax flip rate with bootstrap CIs. (4) A pre-registered claim rule: call behaviour 'psychology-driven' only if the psyche-swap effect is at least 3x the shuffle and neutral-wording effects. 1,000 probes cost about $0.09.",
+    "unlocks": "Defensible claims that decisions are authentic; different drivers for different psychologies, measured rather than assumed; checking that trait evolution actually changes decisions",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Baseline policies as control worlds, and a judge calibrated against them",
+    "problem": "The repo never compares JEV with a random, greedy or position-biased policy, so there is no measure of how much of the society comes from the menu and the physics rather than from JEV. The 'interestingness' judge gets an OWNER_BRIEF listing the exact features to look for (murder, exploiting, charity ...) and a digest made of feature counters. Its 'missing' answer can only name one of our own roadmap keys. It is never shown a control.",
+    "evidence": "Expected antisocial picks per 1,000 real decisions (pickpocket, lie, usury, take): uniform random 87.6, JEV with min-p 4.9, JEV argmax 2.8. Explore: uniform 223 vs JEV 48 (zz/policies.ts). So JEV clearly is not random, but nothing in the repo computes this. After one day, the random-policy (tests/fake-jev) digest already contains attacks, lies, usurious loans and murders: 16 of its 58 summary lines are crime or violence (zz/digest_probe.ts). Over 30 days that random policy took the town from 15 to 3 alive with 77 crimes (seed 31). Nine judged runs in the session lab logs, across 6 different conditions (psyche, economy, drift engine, drift jev, town, justice), got identical labels 9/9 ('villagers very distinct', 'a real community', best part 'psychology'), interest between 1.44 and 2.02 out of 4, and 'missing' was always a roadmap key (conflict_and_justice 5/9). prompt.ts:255 OWNER_BRIEF, :301 missing criteria = ASSESS_ROADMAP.",
+    "proposal": "lib/sim/policies.ts exports answer functions with the same shape as fakeAnswer: uniform, needs_greedy (lowest need first, never antisocial), first_option, jev_argmax. WorldConfig.policy selects one, and Session and lab run it through the same pipeline (lab --policy). Every reported metric becomes 'JEV minus control' over at least 5 seeds. Judge: make it pairwise (a JEV run against a control digest, random order, blinded titles), remove the feature checklist from OWNER_BRIEF, and add a discrimination question ('which run was produced by random choices?'). Trust it only once it prefers JEV runs over uniform-policy runs at least 80% of the time. Use its 'missing' output as advice only, never as roadmap evidence.",
+    "unlocks": "A genuinely interesting social experiment (measured against chance); honest live metrics; roadmap choices that do not rest on a judge that agrees with everything",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Make the sampling rule a declared, logged experimental parameter",
+    "problem": "MIN_P = 0.25 is a hidden constant that changes the moral makeup of the society, and question types use different rules: min-p for decide and for the reflection change, goal, gratitude and grudge answers; raw Bernoulli(p) for chat engage and press-on; argmax for the reflection 'keep' answer. JEV is a calibrated evaluator, so its distribution is its belief, and min-p systematically cuts off the rare-but-plausible tail on both the kind and the cruel side.",
+    "evidence": "From 1,413 real decisions: min-p removes on average 20.0% of JEV's mass (p90 35%, max 58%). The median decision has 3 eligible options, and 24% of decisions have just 1 (effectively argmax). Expected per 1,000 decisions, with full calibrated sampling vs min-p 0.25 vs argmax: gifts plus loans 3.4 / 0.1 / 0; antisocial 10.3 / 4.9 / 2.8; P(pick differs from argmax) 0.51 vs 0.38. Code: engine.ts:2616 MIN_P, 2624 roll; 3019 press and 3068 engage use nextRandom < p; reflection keep uses keep.choice (argmax) while change and goal use pickFrom.",
+    "proposal": "WorldConfig.sampling = {rule: 'full' | 'minp' | 'argmax', minP}, recorded in the checkpoint and the run. One sample(world, agentId, questionId, probs) function for every choice, boolean and score-level question. Log the eligible set and pruned mass per decision (see provenance). Use 'full' as the default arm for authenticity claims and 'minp 0.25' as a named ablation, and report crime, kindness and economy metrics for each arm.",
+    "unlocks": "Being kind or charitable, crime, exploitation and manipulation arising at JEV's own rates instead of at a rate fixed by one constant",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Menus with mechanics-backed consequences, a neutral-wording arm, and verb/target factoring",
+    "problem": "The menu is the policy's prior, and at present it is a moral text. Every antisocial verb carries a warning and no prosocial verb does. Some warnings describe consequences that do not exist. The engine picks victims and beneficiaries, not JEV. Option count inflates some categories. Several reply questions change nothing but the wording of a memory, so their outcome is fixed in advance and they tell us nothing about authenticity.",
+    "evidence": "Wording audit of the current engine (zz/wording.ts): take, lie, usury, pickpocket, shove, attack and kill all carry warning clauses; the give_coins detail is 11 words and carries none. engine.ts:1169 price_high says 'People who notice may resent it', but set_price (around 1962-1972) only sets shop.price and logs, with no affinity or perception effect. engine.ts:1464 kill says 'the town may never forgive you', but die() (1554-1590) only moves affinity for witnesses who were already fond of the victim (-0.6). Explore takes 7 options per menu (5,936 explore options across 848 menus). Targets are chosen by the engine: gift, ask, lie, lend, usury and pickpocket only toward the nearest person (1281); violence only toward the lowest-affinity adult within 8 steps (1441); kill only with a grudge or affinity <= -0.4. Clone-and-diff test (zz/decorative.ts, 4 seeds): for attack replies, plead, call_help and take_it gave identical world states in 29 of 46 cases; warn accept and argue were identical; arrest go_quietly and protest differ only in memory text (2907-2928).",
+    "proposal": "OptionSpec gains effects: EffectId[], and the detail text is rendered only from an EFFECTS table ('anyone within 6 steps will see', 'costs 5 coins', 'the shopkeeper's customers see the new price'). tests/consequences.test.ts applies each effect-bearing option or reply to a cloned world and asserts the state change the wording claims. A reply whose options produce identical states fails the test. Add an ablation wording: 'authored' | 'neutral' (mechanical facts only). Factor social verbs: first pick a verb, then run a second JEV choice 'who' over the people in sight (at most 255 options, which fits JEV), or list verb x target when it fits. Collapse explore_* into one option followed by a 'where' choice. Give arrest a resist/flee reply with real consequences, and give call_help a real mechanic (nearby people get a respond call).",
+    "unlocks": "Choosing whom to help, rob or hurt, and why (psychology driving the choice); 'destroy someone's house and they get angry' being grounded in state; honest option text",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Long-run stationarity: demography, role seats, mean-reverting drift and money sinks",
+    "problem": "At 48 in-game days per real hour, a world that runs for weeks lives through thousands of in-game days, and every stock variable heads to an absorbing boundary. Population: death comes only from violence, and there are no births, no arrivals and no aging. Roles: jobs are fixed on the persona and shops have a fixed keeperId, so a dead shopkeeper or officer means that institution is gone for good. Cases whose suspect is dead stay open. Money: the county grant arrives no matter what anyone does, and nothing drains money in proportion to how much exists. Personality: drift has a hard \u00b125 wall and no pull back toward the original, so the cap, not experience, ends up defining who people are. Collapse never kills, so starvation becomes a repeating nap.",
+    "evidence": "Measured, 30-day runs (zz/longrun.ts). Random policy: 15 to 3 alive by day 21 (seed 31; seed 32: 3 by day 30), 10 open cases frozen from day 15. Needs-greedy benign policy: 131 collapses and 0 deaths. Money supply followed the same path under both policies, 1,843 to 5,279 and 5,285 (+120 per day, the grant), with shop tills stuck at 2 coins from day 10 so deliveries stopped. Prices are constants inside option ids (4/7/3, engine.ts:1160-1177). Drift, bootstrapped from 27 real JEV reflections through lib/sim/drift.ts (zz/driftsim.ts): first path hits the \u00b125 cap on day 14 (about 17 real minutes at 1x); 29 paths by day 100; 74 by day 300; 8 of 15 villagers' trust pinned at the cap by day 100. engine.ts:197 keeperId fixed; die() is called only from the two violence paths (around 2981 and 3046); persona.age is only ever rendered as text; drift.ts:22-24 DAILY_CAP 3 and LIFETIME_CAP 25.",
+    "proposal": "(a) Seats: world.seats: Record<JobId, {holderId|null, since}>. shopOpen and officerOf look up the seat holder. A vacancy (death, jail, quitting) triggers a JEV 'apply' boolean for eligible adults and a mayor 'appoint' choice. (b) Demography: age advances at lifePace years per in-game day; coming of age at 16; a natural-death hazard; births from partnered households (two JEV consent booleans); an 'arrival' event when population falls below a floor, using a persona generator. (c) Drift: nightly psyche += 0.02 x (birth - psyche), and scale each delta by (1 - |deviation|/40) instead of a hard wall, so the long-run personality reflects how often things happen. (d) Money: the treasury funds public works and wages by rule, there is a stock-proportional sink (spoilage or upkeep), and prices are relative levels (cost plus a margin chosen by JEV) rather than constants. (e) Weekly stationarity metrics (alive, births minus deaths, coins per capita, share of traits at the cap, vacant seats) with a trend alarm.",
+    "unlocks": "Reproduction, more actors, groups forming over generations, a real economy, traits that keep changing, and a world that is never reset",
+    "impact": 5,
+    "cost": "L"
+   },
+   {
+    "title": "Liveness invariants and bounded state for unattended runs",
+    "problem": "There is no fallback brain, so any structural failure freezes a villager for good. The decide schema allows at most 64 options while menus keep growing with each feature. A rejected request backs off and rebuilds the same menu indefinitely. The deciding, asking and considering statuses have no timeout. Unbounded arrays (crimes, debts, cases, agent.knows) are scanned during every decision.",
+    "evidence": "lib/jev/schema.ts:69 options .max(64). Current engine menus (zz/longrun.ts): p50 27-28, p99 41, max 52 (the officer Odile, random policy, seed 31), up from max 28 on the older engines. A request over 64 options is rejected by /api/jev, failRequest backs off ERROR_BACKOFF_TICKS 12, and step() rebuilds the same menu. engine.ts:2513 'case deciding: break' with no timeout. In 30 random-policy days: 77 crimes, 46 debts, 246 knows entries, 15 cases (10 stuck open). The officer's open_ loop at engine.ts:1387 does world.crimes.find inside agent.knows, which is O(knows x crimes). Per-tick cost is not a problem yet (0.16-0.28 ms per tick, 46-83 ms per in-game day).",
+    "proposal": "lib/sim/invariants.ts checkWorld(world) runs every in-game hour in lab and tests and before every checkpoint write. It checks: menu length within the cap (truncate by salience and log 'truncated', or raise the cap toward JEV's 255 together with the factoring in the menu fundamental); no agent waiting more than MAX_WAIT ticks (auto-fail and log); every referenced agent id alive or its record resolved (close cases whose suspect or victim has died); coins and food conserved; exactly one status per agent. Move resolved debts, cases, crimes and lies older than 7 in-game days out of the snapshot into the history segment. Store crimes in a Record keyed by id.",
+    "unlocks": "A world that runs unattended for days; performance audits that stay flat over long runs",
+    "impact": 3,
+    "cost": "S"
+   }
+  ],
+  "measurements": [
+   {
+    "what": "Replay of the 13 recorded real-JEV runs on current HEAD",
+    "value": "13/13 wrong: populations mismatch (15 vs 10 or 4) and desyncs up to 638/653; the 4-villager runs report 0 desyncs yet replay into a 15-villager town",
+    "how": "scratch longev/replay_check.ts using ReplayCursor from git-archived HEAD and working-tree copies"
+   },
+   {
+    "what": "Replay of each run on the commit recorded closest to it",
+    "value": "6/10 clean; psyche-founders-s200 292/356, economy-v1 524/622, fernhollow 88/387 and 48/334 desync on every commit (recorded on uncommitted code)",
+    "how": "git archive of 62cf928, 41e9ca9, 2c969d7, 105aa84, 48f19da into the scratchpad; longev/replay_commits.sh"
+   },
+   {
+    "what": "Silent desync",
+    "value": "desyncs=0 reported while 93 of 105 decide answers were applied to the wrong villagers and 43 were unusable ('unknown option talk_juniper')",
+    "how": "head/zz_silent.ts replaying scarcity-baseline-s100 on HEAD"
+   },
+   {
+    "what": "Butterfly sensitivity (one answer delayed by one tick)",
+    "value": "Shared RNG: 281/288 ticks differ, 15/15 agents, 65/90 counters after one day. Keyed per-agent RNG patch: 1 tick, 1 agent, 0 counters",
+    "how": "zz/butterfly.ts on the working-tree copy, and on a scratch copy with the 4 nextRandom sites replaced by keyed streams"
+   },
+   {
+    "what": "Real JEV latency and staleness",
+    "value": "p50 290 ms, p90 2,426 ms, p99 6,656 ms (n=4,048); 9 ticks stale at p90 at 1x, 37 at 4x; lab think=1",
+    "how": "zz/latency.ts over all runs/*.json.gz answer events"
+   },
+   {
+    "what": "Real JEV decision distributions",
+    "value": "n=1,413; menu 9-28 options (median 20); p_top median 0.44 (p90 0.78); normalized entropy median 0.53",
+    "how": "longev/jev_dist.ts replays 5 clean runs on their own commits to recover option order; longev/analyze.ts"
+   },
+   {
+    "what": "Min-p 0.25 effect",
+    "value": "prunes 20.0% of mass on average (p90 35%, max 58%); median 3 eligible options, 24% with only 1; per 1,000 decisions gifts plus loans 3.4 (full) vs 0.1 (min-p) vs 0 (argmax); antisocial 10.3 vs 4.9 vs 2.8",
+    "how": "zz/policies.ts applying argmax, min-p 0.25, min-p 0.1, full, uniform and first-option rules to the same 1,413 real probability vectors"
+   },
+   {
+    "what": "Position vs content confound",
+    "value": "position 0 is 'eat' in 93% of menus, the last position is 'rest' in 100%; the first 40% of positions hold 66.1% of mass while making up 42.3% of options; the current engine keeps the same order (eat at 0.02, rest at 1.00)",
+    "how": "analyze.ts position quintiles; zz/wording.ts relative positions on the current engine"
+   },
+   {
+    "what": "Random baseline vs JEV",
+    "value": "antisocial acts per 1,000 decisions: uniform 87.6 vs JEV min-p 4.9; explore: uniform 223 vs JEV 48",
+    "how": "zz/policies.ts on real menus"
+   },
+   {
+    "what": "Judge sensitivity",
+    "value": "9 judged runs across 6 conditions: labels identical 9/9, interest 1.44-2.02 out of 4, 'missing' always a roadmap key",
+    "how": "grep of 'JEV assessment' in the session scratchpad lab-*.log files"
+   },
+   {
+    "what": "Decorative replies",
+    "value": "attack: plead, call_help and take_it gave identical world states in 29/46 cases; warn accept = argue; arrest replies change only memory text",
+    "how": "zz/decorative.ts: clone the world, apply each reply, diff state excluding memory, log and decision records, 4 seeds x 4 days"
+   },
+   {
+    "what": "Long-run trajectory, 30 days",
+    "value": "random policy: 15 to 3 alive by day 21; needs-greedy: 0 deaths but 131 collapses; money supply 1,843 to 5,279 and 5,285 under both policies (+120 per day); tills stuck at 2 coins from day 10",
+    "how": "zz/longrun.ts with fake-jev and a benign needs-greedy policy, seeds 31 and 32"
+   },
+   {
+    "what": "Drift saturation",
+    "value": "first path at the \u00b125 cap on day 14, 29 paths by day 100, 74 by day 300; 8 of 15 villagers' trust at the cap by day 100",
+    "how": "zz/driftsim.ts bootstrapping 27 real JEV reflection answers through lib/sim/drift.ts reflectDrift for 1,000 days"
+   },
+   {
+    "what": "Menu size in the current engine",
+    "value": "p50 27-28, p99 41, max 52 (the officer), against a schema cap of 64",
+    "how": "zz/longrun.ts recording req.options.length for each decide, 30 days"
+   },
+   {
+    "what": "Snapshot anatomy and performance",
+    "value": "970 KB JSON / 143 KB gzip, 87% decisions[].state; stringify plus parse 2.6 ms, structuredClone 3.2 ms; events about 197 KB per in-game day; 0.16-0.28 ms per tick",
+    "how": "zz/snapsize.ts after 5 stub days; per-day timings from zz/longrun.ts"
+   },
+   {
+    "what": "Time compression and spend",
+    "value": "74.9 s per in-game day at 1x = 48 in-game days per real hour; recorded Fernhollow cost $0.033-0.037 per in-game day, i.e. about $1.6-1.8 per real hour at 1x and about $6.5-7 at 4x",
+    "how": "BASE_TICK_MS 260 x 288 ticks; meta.costUsd of the fernhollow-founders-s600 records"
+   }
+  ],
+  "quick_wins": [
+   "Stamp ENGINE_VERSION (VERCEL_GIT_COMMIT_SHA) and a prompt hash on every Checkpoint and RunRecord, and make ReplayCursor throw on a mismatch instead of silently applying answers",
+   "Add agentId and kind to RunEvent and count a mismatch as a desync (this alone would have flagged the silent 93-answer corruption)",
+   "Replace the four nextRandom(world) call sites with keyed per-agent streams (a 7-line change measured to turn 15/15 divergence into 1 agent for 1 tick)",
+   "Save one immutable checkpoint per in-game day under live/<id>/cp/ instead of overwriting a single blob",
+   "Seeded-shuffle the decide options and log shownOrder, eligible set and pruned mass",
+   "Move MIN_P into WorldConfig, record it, and use one sampling function for decide, reply, engage, press and reflect",
+   "Delete 'People who notice may resent it' from price_high (engine.ts:1169), or implement the resentment",
+   "Add uniform and needs_greedy answer functions next to tests/fake-jev.ts and a lab --policy flag",
+   "Guard the 64-option decide cap (truncate with a log line) and time out waiting statuses after N ticks",
+   "Close cases whose suspect or victim has died",
+   "Show spend per real hour in the live UI (about $1.7 at 1x): pausing when no browser is open is also the cost control"
+  ]
+ },
+ {
+  "lens": "performance and scalability (measured with the fake JEV, plus the 13 recorded real-JEV runs in runs/)",
+  "summary": "Engine CPU is not the problem. step() takes 0.15-0.7 ms per tick at 15 villagers and 1.4-2.8 ms at 100, against a tick budget of 65-260 ms. perceive() and buildOptions() stay flat at about 0.1-0.2 ms per call over 30 days. The real limits sit elsewhere, and all four block what Claudio wants.\n(1) The JEV call. A decide sends about 8.8K chars (about 2.2K tokens), and 52% of that is the option list. Real JEV leaves only 2.67 of 25 options eligible under min-p. Decide calls cost twice as much as respond calls, and their p90 latency is 5x higher (2.49 s vs 0.48 s).\n(2) Wall-clock coupling. The live loop never waits for JEV, so the same seed runs a different society at each speed: villagers are frozen 15%, 21% and 33% of the time at 1x, 2x and 4x.\n(3) What gets persisted. The shipped checkpoint is 183 KB gzipped every 8 s, 73% of it decision traces. The replay log is never persisted, and genesis replay already desyncs on recorded real runs.\n(4) Perception built for 15 people. Villager lines come first in `noticing` and the list is cut at 32, so at 60 villagers 38% of decides lose the villager's own coins line, and 70% at 100.\nClock check: 5 minutes per tick means 288 ticks per day, not 144. `KEYFRAME_EVERY=144` is half a day.\nNote: the persistence commit 2db20e2 landed while I was auditing, and I re-measured on it. It already removed the 600-call cap and the per-tick React re-render (renders are now held to at most 8.3 per second).",
+  "fundamentals": [
+   {
+    "title": "Perception budget that survives more actors: own facts first, salience-ranked people, an aggregate line",
+    "problem": "perceive() pushes one line per visible villager first (engine.ts:908-915). Only after that come the villager's own money, job, shops, pantry and debts. Then it cuts at 32 lines (engine.ts:1002, schema.ts:56 max 32). As the population grows, crowds push the villager's own situation out of what JEV reads. Their choices then stop reflecting their own circumstances, which undermines authentic decisions.",
+    "evidence": "crowding.ts (clones placed at the founders' homes), percentage of decide requests:\n- 15 agents: 0% at the cap.\n- 30 agents: 10.5% at the cap.\n- 60 agents: 65.8% at the cap; own coins line dropped 38.2%, job line 31.5%, chapel pantry line 29.2%.\n- 100 agents: 79.7% at the cap; coins dropped 69.8%, job 59.2%, pantry 44.5%.\nState text at 100 agents stays about 4.0K chars only because of this truncation.",
+    "proposal": "Build `noticing` from fixed-budget sections:\n- Self facts (coins and carry, job and shift, home pantry, own debts, grief, jail) always come first and are never cut.\n- Places, then public goods.\n- People: the top K=8 by a salience score (same building > adjacent > currently interacting with me > |affinity| >= 0.35 or a grudge or gratitude > distance), followed by one aggregate line such as \"23 others are around the plaza, mostly chatting; 4 are at the diner.\" This line is computed by grouping visible agents by `describeLocation` and status kind.\n\nImplementation: in perceive(), build `people: {salience, line}[]`, sort, slice(0, 8), then add the aggregate line. Keep the zod max. This is pure and deterministic, and costs O(n log n) per call.",
+    "unlocks": "More actors and reproduction, groups forming (the aggregate line is the natural place for crowds and factions), and decisions that stay grounded in the villager's own situation at scale",
+    "impact": 5,
+    "cost": "S"
+   },
+   {
+    "title": "Factorize the decide call: verbs once, then whom and where as separate choice questions in the same evaluate call",
+    "problem": "Every person-directed act is a cross-product of verb and target, and every place is its own long option. The list is expensive, mostly dead weight, and restricted by design: TALK_OPTIONS=3 nearest people (engine.ts:69,1260), and gifts, loans and pickpocketing only toward the single nearest person (engine.ts:1281). A villager cannot be kind to, or kill, someone who is not nearest. Adding people or verbs grows the list multiplicatively toward the 64-option zod cap.",
+    "evidence": "From validate.ts, factorize.ts and token-anatomy.ts over the fake runs:\n- Decide input: state 3,483 chars + action criteria 4,537 + instructions 276 + motive 435 + mood 68, so criteria are 52% of the input.\n- Person-targeted options are 38.1% of criteria (11.4 options over 3.63 distinct targets).\n- The 7 explore_* options are 26.8% of criteria.\n- Police officer peaked at 52 options, and 60 at 100 agents (cap 64).\n\nFrom the real Fernhollow runs (558 decides):\n- 25.2 options offered, only 2.67 eligible under min-p 0.25, 10.07 above 1%.\n- Explore was picked 1.8% of the time.\n\nFrom lat-by-size.ts over the real runs:\n- Decide cost rises with option count: $0.000082 (<15), $0.000093 (15-21), $0.000109 (22-27), $0.000121 (28+).\n- Respond (about 470 chars of questions): $0.000051, p90 481 ms. Decide: $0.000103, p90 2,486 ms, on a similar state size. This is a correlation, not proven causation.",
+    "proposal": "In decideQuestions:\n- `action`: one criterion per verb (\"chat with someone\", \"give food to someone\", \"pick someone's pocket\", \"attack someone\", \"explore somewhere\", plus untargeted acts). Keep world-fixed joint options as is (repay_<debt>, report_<crime>, arrest_<case>).\n- `whom`: a choice over visible, approachable villagers, up to 255, each labelled with name, distance and one-line status. Read it only when the chosen verb is targeted.\n- `where`: the POI list with short labels.\n- Ask `motive` on a deterministic 1-in-4 sample, since it is measurement-only.\n- Move repeated boilerplate (explore and chat details) into the state once.\n\nEngine side: OptionSpec gains `target: \"person\" | \"place\" | null`, and applyDecision resolves the target from the `whom` or `where` answer via pickFrom.\n\nCaveat: independent questions lose the joint verb-by-target distribution. For violent verbs, confirm with the existing respond-sized `press` step. My estimate is -28% criteria chars at today's 3.6 targets. The larger gain is that cost now grows linearly, not multiplicatively, as targets are added.",
+    "unlocks": "Kill, harm or be kind to anyone, not just the nearest person; more actors without hitting the option cap; lower cost per call and plausibly a shorter latency tail",
+    "impact": 5,
+    "cost": "M"
+   },
+   {
+    "title": "Deterministic think time in game ticks, hedged calls and burst smoothing, so dynamics do not depend on speed or network",
+    "problem": "The live clock never waits for JEV (use-sandbox.ts:283-290). An answer lands whenever the network delivers it, while lab lands it `think` ticks later (lab.ts:87-91). The same seed is a different society at 1x, 2x and 4x, and different again from lab. Results are neither comparable nor reproducible across sessions. Wake-up bursts send up to N simultaneous calls, which slows them all.",
+    "evidence": "latency-sim.ts replays the real latency distribution (2,592 answers: p50 282 ms, p90 2,454 ms, p99 6,687 ms):\n- Villagers are frozen waiting on JEV 0% (lab), 15.3% (1x), 21.1% (2x), 33.0% (4x) of alive time.\n- Decisions per day: 203, 171, 136, 113.\n\nlat-by-size.ts: same-tick bursts of 9+ calls ran at p50 897 ms, vs 289 ms solo.\n\nbench: requests per tick max = N at every scale (15/30/60/100).\n\nbarrier-sim.ts, strict lockstep (answer applied at issue+T, clock stalls if late), as a share of the nominal 1x pace (75 s per sim day):\n- T=1: 46%.\n- T=2: 53%.\n- T=2 plus a hedged duplicate at 1 s: 69%, for +18.9% calls.\n- T=6 plus a hedge at 1.5 s: 88%.\n- 4x is at best 36%.\nHedging assumes the retry's latency is independent of the first call's, which is optimistic.",
+    "proposal": "1. Add `THINK_TICKS` (for example 2 ticks, 10 game minutes) to the engine contract. An answer is applied exactly at issueTick+THINK. If it has not arrived, the clock stalls: a barrier in Session.tick() that refuses to step while an overdue request is pending.\n2. Hedge any request older than about 1-1.5 s with an idempotent duplicate. The first answer wins and is recorded once.\n3. Add a live concurrency semaphore (the lab already uses 24).\n4. Jitter scheduled mass decisions (wake-up, reflection) with the seeded RNG across 0-3 ticks.\n5. The UI shows the achieved speed; the speed control becomes \"max speed\".\n\nLive, lab and replay then produce the same world for the same answers at any speed.",
+    "unlocks": "Authentic decisions that can be compared across runs and experiments, and a stateful world whose history does not depend on which tab or network drove it",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Take the decision trace out of World; checkpoint only the lean state",
+    "problem": "`agent.decisions` holds 24 full DecisionRecords per villager: the whole option list, and until 2db20e2 the full state text. It dominates everything that copies or saves the world: checkpoints every 8 s, spectator downloads, ReplayCursor keyframes, structuredClone.",
+    "evidence": "world-anatomy.ts, day 7, 15 agents:\n- World 2,161 KB, of which decisions are 2,030 KB (94%).\n- Lean world 131 KB raw / 19 KB gz; without the static map 92 KB / 15 KB.\n\ncheckpoint-bench.ts on the shipped makeCheckpoint:\n- Day 7: 1,300 KB raw / 183 KB gz; 73% decisions (55% the option lists alone), 16% metrics.\n- Written every 8 s (use-sandbox.ts:19): 450 PUTs and about 82 MB gz uploaded per driving hour.\n- 100 agents, day 2: 7,220 KB raw / 1,140 KB gz per write; stringify 9.6 ms + gzip 34 ms.\n\nlean-checkpoint.ts (latest decision full, history as {tick, picked, p}, map and persona by id, metrics as rounded columns): 250 KB raw / 41 KB gz, 4.5x smaller.\n\nreplay-mem.ts: keyframes grow the heap 30 MB over 7 days and 125 MB over 30 days.",
+    "proposal": "Change the Agent type: `decisions` becomes `lastDecision: DecisionRecord | null` plus `history: {tick, kind, picked, pickedLabel, p}[]` (cap 24).\n- Full records, including the state text, go to an append-only trace written next to the checkpoint as a delta. For example live/<id>/trace/<day>.jsonl.gz, or IndexedDB for the local role. The inspector's JEV tab lazy-loads from it.\n- makeCheckpoint omits tiles, buildings, landmarks, POIs and fields (rebuilt by buildTownMap in hydrateWorld) and personas, which are resolved by id.\n- Metrics are stored as a columnar {ticks[], id: number[]} with 3-decimal rounding.\n- ReplayCursor keyframes clone the lean world.",
+    "unlocks": "Cheap, frequent saves for a fully stateful world; spectators and history viewers that scale to 100 villagers and 30+ days",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Persist the event log as the history: checkpoint plus event tail, pinned to an engine version, streamed to spectators",
+    "problem": "Checkpoints are the source of truth (good), but the replayable history is not persisted. Session.events lives only in the driving tab's memory: the Checkpoint type in checkpoint.ts has no events field, and after a reload RunRecord.start begins at the resumed world. Genesis replay cannot survive deploys, and every push to main deploys. Spectators adopt a whole new Session from each checkpoint (use-sandbox.ts:330-339), so they see the town jump about 31 ticks every 8 s with no motion.",
+    "evidence": "replay-real.ts, the two real Fernhollow records replayed on today's engine: 88 of 387 and 48 of 334 answer events desync.\n\nWithin one engine version, replay is fast: 1 day 57-86 ms, 7 days 319-382 ms, 30 days 0.84-1.33 s, 0 desyncs.\n\nIn-tab log growth: 1,245 events / 1.4 MB at 7 days, 3,966 events / 4.5 MB at 30 days, lost on reload.\n\nReal records are about 800 B per answer event and 41-45 KB gz per sim day.\n\nwire-size.ts at 1x: the event stream is 923 B per tick (3.5 KB/s). A per-tick view state would be 2.45 KB raw / 468 B gz. Spectators currently pull a 183 KB gz checkpoint every 8 s (about 23 KB/s).",
+    "proposal": "- Add `engine: ENGINE_VERSION` (a constant, bumped on any change to engine behaviour) and `eventSeq` to the Checkpoint.\n- The driver appends RunEvents in batches with each save, to live/<id>/events/<engineVersion>/<day>.jsonl.gz.\n- Resume loads the checkpoint, then applies tail events with eventSeq greater than the checkpoint's, only if the engine version matches.\n- The runs viewer replays each segment from its own checkpoint under its own version.\n- Spectators long-poll or SSE the event tail and run the same pure engine locally, so they see live motion, falling back to the checkpoint on a version or eventSeq gap.\n- Also match answers by (tick, agentId, kind) as a secondary key, so a desync is detected and reported per event.",
+    "unlocks": "A fully stateful world with a complete, replayable history across reloads and deploys; live-looking spectators; the base for a server-side driver later",
+    "impact": 4,
+    "cost": "M"
+   },
+   {
+    "title": "Honour \"stop when I'm not watching\" and remove the hidden hard stop (the $10 key budget)",
+    "problem": "A backgrounded tab is still \"open\": the worker clock keeps ticking (use-sandbox.ts:92-106, 270-297) and keeps spending with no per-session ceiling, since 2db20e2 removed the 600-call cap. Meanwhile the gateway key's $10 monthly budget (AGENTS.md) acts as an invisible hard cap. When it is exhausted, every /api/jev call fails, and villagers stand still, retrying. Claudio said a closed browser may pause the world, not that a hidden tab should run it for days.",
+    "evidence": "From the real runs:\n- A 15-villager Fernhollow sim day is 334-387 calls, $0.033-0.037.\n- At 1x a sim day is 288 x 260 ms = 75 s. That is about $1.4-1.8 per wall-clock hour (the low end allows for about 16% fewer calls under live latency, per latency-sim.ts), or about $40 a day if a tab is forgotten.\n- The $10 monthly key lasts about 6 hours at 1x.\n- At 100 villagers, calls per day scale about 7x (fake: 230 to 1,628), about $10-12 an hour at 1x.",
+    "proposal": "- Pause the clock when no tab showing the world has been visible for more than about 5 minutes. The driver tracks document.visibilityState, and spectators send a visible-heartbeat through the claim route. Resume on the first visible tab.\n- Show a spend meter in the header: this hour, today and this month, from a persisted world.stats.costUsd plus a daily ledger in the checkpoint. This informs; it does not cap.\n- Raise or replace the $10 key budget so the world does not silently freeze. If the budget stays, surface a clear \"JEV budget exhausted\" state instead of a string of per-villager errors.",
+    "unlocks": "Uncapped JEV exactly as Claudio asked, without a forgotten tab burning money or the world freezing without explanation",
+    "impact": 4,
+    "cost": "S"
+   },
+   {
+    "title": "Population as world state, not config: deterministic births and immigrants with a seeded id and persona generator",
+    "problem": "createWorld always maps the fixed PERSONAS list (engine.ts:143-192), and WorldConfig holds only seed, scenario and driftModel. A record or config cannot express who exists, so any change in population (reproduction, immigration, more actors) breaks replay. homeOf() scans every building's residents on each call (engine.ts:303-307), and many hot paths call it.",
+    "evidence": "bench.ts with 30, 60 and 100 agents (clones added after createWorld), replayed from the record: 512 of 527, 982 of 997 and 1,727 of 1,742 events desync. hydrateWorld falls back to fresh.agents[0] for agent ids it does not know (checkpoint.ts:86).",
+    "proposal": "- Add `world.agentSeq` and an engine function `spawn(world, spec)` that builds persona, psyche and home deterministically from the world RNG. Trigger it only from engine events (birth after a JEV partnership decision, a scheduled immigrant) or a recorded Intervention {kind: \"arrival\"}.\n- Keep `world.residence: Record<agentId, buildingId>` as an index.\n- Checkpoints already carry agents, and replay stays exact because spawning is part of step().",
+    "unlocks": "Reproduction, more actors and families, with replay and resume that stay exact",
+    "impact": 3,
+    "cost": "M"
+   },
+   {
+    "title": "Canvas: cache what does not animate; draw only on change",
+    "problem": "Every animation frame redraws the 21 buildings, 6 bushes and every villager pixel by pixel with fillRect, 60 times a second, even when the world is paused (world-canvas.tsx frame(), from line 249). The cost of the character layer grows linearly with population.",
+    "evidence": "canvas-count.ts runs the frame() body against a counting context. Per frame: 8,465 fillRect + 6,938 fillStyle sets (15.4K calls).\n- Buildings: 5,239 fillRects (62%).\n- Characters: 1,582 for 13 villagers (about 120 each).\n- Animated tiles: 764 for 86 tiles.\n- Bushes: 737 for 6 bushes.\n- Labels: 143.\nAt 100 villagers outside, characters alone would be about 12K fillRects per frame. (I could not time the browser raster: the preview pane will not run scripts from a local file.)",
+    "proposal": "- Paint buildings into the static layer, keyed by (lit set, night bucket), and repaint only when those change.\n- Cache bushes per berry count.\n- Pre-render character sprites per persona x facing x walkFrame into ImageBitmaps, so each villager is one drawImage call.\n- Throttle water and fountain animation to about 8 fps, and skip the frame entirely when paused with no camera change.\n\nFrom the measured layer counts this is under 1K fillRects per frame.",
+    "unlocks": "100+ villagers on screen and a quiet CPU when the tab is merely open",
+    "impact": 3,
+    "cost": "S"
+   },
+   {
+    "title": "Index and archive the ever-growing ledgers",
+    "problem": "world.crimes, cases, debts, lies and graves, and agent.knows, grow without bound and are scanned linearly in hot paths:\n- perceive() walks every debt ever made (engine.ts:977-985).\n- settleDebts() does the same every tick.\n- The officer's options do knows x crimes.find, plus caseFor = cases.find (engine.ts:1371-1390, 1546).\n- exposeLies scans all lies.\nCPU is flat today, but snapshot size and O(K\u00b7C) scans grow with villagers times days.",
+    "evidence": "bench 30 days, 15 agents (non-lethal fake): crimes 107, knows 340, debts 56, cases 13, graves 8. Bounded today: memory 14, decisions 24, log 250, drift 60, formative 6. buildOptions stays at 0.11-0.2 ms, so the risk is at 100 villagers x 100 days, not today.",
+    "proposal": "- Store crimes and cases as Record<id, ...>, with byCulprit and byCrime indexes.\n- Keep per-agent open-debt id lists.\n- Make knows a Record<crimeId, tick>.\n- Settled debts, closed cases and lies older than LIE_MEMORY_TICKS move out of World into the event log, as they are already recorded there.",
+    "unlocks": "Long-running worlds (weeks) with justice and economy history that stay cheap to perceive and save",
+    "impact": 2,
+    "cost": "S"
+   }
+  ],
+  "measurements": [
+   {
+    "what": "Ticks per sim day",
+    "value": "288 (5 game minutes per tick), not 144. At 1x, 260 ms per tick = 75 s per sim day. KEYFRAME_EVERY=144 is half a day.",
+    "how": "lib/sim/clock.ts MINUTES_PER_TICK=5; sandbox.tsx and lab.ts TICKS_PER_DAY=288"
+   },
+   {
+    "what": "step() ms per tick at 15 agents over 1, 7 and 30 days",
+    "value": "Mean 0.27-0.35 (day 1), 0.11-0.13 (day 7), 0.03-0.06 (day 30). The decline is because the fake JEV's violence and starvation left 3-7 alive by day 30. After JIT warm-up: mean 0.15 ms, worst 2.4 ms at tick 1 (15 simultaneous requests). Re-runs at load average 12 gave 0.4-0.7 ms.",
+    "how": "perf/bench.ts and bench2.ts --days 30 --agents 15 (raw and --peaceful fake); perf/spikes.ts"
+   },
+   {
+    "what": "Scaling to 30, 60 and 100 agents",
+    "value": "ms per tick (day-2 mean): 15 = 0.25, 30 = 0.56, 60 = 0.81, 100 = 1.37 (2.0-5.6 under load). Requests per tick, mean: 0.8, 1.62, 3.28, 5.65; max = N. Fake calls per day: 230, 467, 945, 1,628. Real JEV makes about 1.5x the fake's calls at 15 agents.",
+    "how": "perf/bench2.ts --days 2 --agents N --peaceful, with the founders cloned into their homes"
+   },
+   {
+    "what": "perceive() and buildOptions() cost per call",
+    "value": "perceive 0.08-0.2 ms, buildOptions 0.11-0.2 ms, flat from day 1 to 30 and from 15 to 100 agents (the officer is the same). Each call runs its own full-map BFS.",
+    "how": "bench.ts: every 24 ticks, time both on a structuredClone of the world for every alive agent"
+   },
+   {
+    "what": "JEV state length by call kind (chars, about tokens = chars/4)",
+    "value": "decide: mean 2,970-3,602, p95 3,667-4,184, max 4,663 (about 740-900 tokens); 4,001 mean at 100 agents. respond: 3,119. reflect: 2,738. press: 3,030. Question JSON: decide 5,339 (about 1,335 tokens), reflect 2,056, respond 469, press 308.",
+    "how": "bench.ts: buildJevCall(toWire(world, req)) on every request"
+   },
+   {
+    "what": "Composition of a decide call",
+    "value": "State: psyche 439 + noticing 1,318 (16 lines) + memories 382 + feelings 305 + blurb and needs 1,038. Questions: action criteria 4,537 (52% of the whole input), instructions 276, motive 435, mood 68. About 30 options per decide.",
+    "how": "perf/validate.ts 7 days"
+   },
+   {
+    "what": "How many options real JEV uses",
+    "value": "25.2 offered, 2.67 eligible under min-p 0.25, 10.07 above 1%. 7 explore_* options per decide (26.8% of criteria text), picked 1.8% of the time. Person-targeted options are 38.1% of criteria (11.4 options over 3.63 targets).",
+    "how": "perf/token-anatomy.ts and perf/factorize.ts over the 2 real Fernhollow records plus engine output"
+   },
+   {
+    "what": "Real JEV cost and latency by kind and size",
+    "value": "decide $0.000103, p50 306 / p90 2,486 ms. respond $0.000051, p90 481 ms. reflect $0.00009, p90 2,611 ms. Decide cost by option count: <15 $0.000082, 28+ $0.000121. Same-tick bursts of 9+ calls: p50 897 ms vs 289 ms solo.",
+    "how": "perf/lat-by-size.ts over 4,191 answers in runs/{fernhollow,economy,drift,psyche}*"
+   },
+   {
+    "what": "Real cost per sim day and per wall-clock hour",
+    "value": "15 villagers: 334-387 calls, $0.033-0.037 per sim day, which is about $1.4-1.8 per hour at 1x. The $10 monthly key lasts about 6 hours at 1x.",
+    "how": "perf/runs-meta.ts on runs/fernhollow-founders-s600-*.json.gz; 75 s per sim day at 1x"
+   },
+   {
+    "what": "Time villagers spend frozen waiting for JEV at each UI speed",
+    "value": "lab 0%, 1x 15.3%, 2x 21.1%, 4x 33.0% of alive agent-ticks. Decisions per day: 203, 171, 136, 113 for the same seed.",
+    "how": "perf/latency-sim.ts using 2,592 real latencies (p50 282, p90 2,454, p99 6,687 ms)"
+   },
+   {
+    "what": "Lockstep barrier speed achieved (share of 1x)",
+    "value": "T=1: 46%. T=2: 53%. T=2 plus a hedge at 1 s: 69% (+18.9% calls). T=6 plus a hedge at 1.5 s: 88% (+15.4% calls). 4x is at best 36%.",
+    "how": "perf/barrier-sim.ts with real latencies and the 15-agent request pattern"
+   },
+   {
+    "what": "World JSON size and structuredClone as days pass (15 agents)",
+    "value": "Day 1: 1,233 KB; days 3-30: steady about 2.2 MB, of which decisions are 2.03-2.1 MB (94%). structuredClone 2-5 ms, JSON.stringify 3-4 ms. At 100 agents, day 2: 15.6 MB, clone 22 ms, stringify 25 ms. Lean world without decisions: 131 KB / 19 KB gz, clone 0.53 ms.",
+    "how": "bench.ts daily; perf/world-anatomy.ts"
+   },
+   {
+    "what": "Unbounded arrays (30 days, 15 agents, non-lethal fake)",
+    "value": "crimes 107, agent.knows 340 in total, debts 56, cases 13, graves 8, lies 0-1, Session.events in the tab 3,966 (4.5 MB, not persisted), Session.metrics in the tab 722 (trimmed to 168 only when saved). Bounded: memory 14, decisions 24, log 250, drift 60, formative 6, favors up to n\u00b2, counters about 80-110 keys.",
+    "how": "bench2.ts daily counters"
+   },
+   {
+    "what": "Shipped checkpoint (2db20e2) size and cost",
+    "value": "15 agents: day 1 826 KB / 127 KB gz; day 7 1,300 / 183; day 30 1,322 / 182. 73% is decisions (55% option lists, 12-19% the 3 kept state texts), 16% metrics. Stringify 1.4 ms, gzip 5.6 ms, hydrate 2.4 ms. 450 PUTs per driving hour, about 82 MB gz. 100 agents, day 2: 7,220 KB / 1,140 KB gz, stringify 9.6 ms, gzip 34 ms. Lean variant: 250 KB / 41 KB gz.",
+    "how": "perf/checkpoint-bench.ts and perf/lean-checkpoint.ts calling makeCheckpoint and hydrateWorld from lib/sim/checkpoint.ts"
+   },
+   {
+    "what": "Event log bytes per sim day",
+    "value": "Fake record: 274 KB raw / 51 KB gz on day 1 (events 241 KB), then about 120-270 KB raw per day. Real records: 309-329 KB raw / 41-45 KB gz per sim day, about 800 B per answer event (all-option probabilities).",
+    "how": "Session.toRecord daily in bench.ts; perf/record-anatomy.ts on real runs"
+   },
+   {
+    "what": "ReplayCursor time and memory",
+    "value": "1 day 57-86 ms, 7 days 319-382 ms, 30 days 838-1,329 ms, 0 desyncs within one engine version. Keyframe heap growth: 30 MB (7 days), 125 MB (30 days). Seeking back to mid-run: 5 ms. The real Fernhollow records desync 88 of 387 and 48 of 334 events on today's engine.",
+    "how": "bench.ts replay_*; perf/replay-mem.ts (bun:jsc heapStats); perf/replay-real.ts"
+   },
+   {
+    "what": "Perception truncation at scale",
+    "value": "noticing hits the 32-line cap: 0% at 15, 10.5% at 30, 65.8% at 60, 79.7% at 100 agents. Own coins line dropped: 38.2% at 60, 69.8% at 100. Job line dropped: 31.5%, 59.2%.",
+    "how": "perf/crowding.ts, 2 days per population"
+   },
+   {
+    "what": "Canvas work per animation frame",
+    "value": "8,465 fillRect + 6,938 fillStyle sets. Buildings 5,239 (21), characters 1,582 (13), animated tiles 764 (86), bushes 737 (6), labels 143. The JS side issues them in 0.19 ms (mock context); raster cost not measured.",
+    "how": "perf/canvas-count.ts replicating world-canvas.tsx frame() with a counting Proxy context"
+   },
+   {
+    "what": "React panel render cost (server-render proxy)",
+    "value": "MetricsPanel 0.18 ms (26 samples) to 0.54 (170) to 2.0 ms (722; plotted into a 240-unit-wide SVG, metric-strip.tsx:8). VillageLog 0.10-0.13 ms. Inspector 0.11-0.19 ms. sampleMetrics per render 0.06-0.13 ms at 15 agents, 1.2-2.4 ms at 100. Renders are now held to at most 8.3 per second (RENDER_EVERY_MS=120).",
+    "how": "perf/render-bench.ts with react-dom/server renderToString, NODE_ENV=production"
+   },
+   {
+    "what": "Wire bytes",
+    "value": "/api/jev request 7.4 KB and answer 4.5 KB on average (the answer echoes the 3.5 KB state). View state 2.45 KB per tick raw / 468 B gz. Event stream 923 B per tick. At 1x: 9.2 KB/s vs 3.5 KB/s.",
+    "how": "perf/wire-size.ts"
+   },
+   {
+    "what": "Validation headroom",
+    "value": "0 of 3,966 requests fail the route's zod schema over 30 days. Police officer peaks at 52 options, 60 at 100 agents (cap 64).",
+    "how": "perf/validate.ts with jevRequestSchema.safeParse on every toWire()"
+   }
+  ],
+  "quick_wins": [
+   "Memoize sampleMetrics(world) by world.tick in use-sandbox.ts:392. It runs on every render and costs 1.2-2.4 ms at 100 agents. Also stop calling alive(world) inside the flatMap in metrics.ts affinities().",
+   "Downsample each metric series to at most 240 points (the strip is 240 units wide, metric-strip.tsx:8), and memoize MetricsPanel on samples.length. Today 722 points per strip at 30 days.",
+   "Collapse the 7 explore_* options into one 'Explore somewhere' option plus a short `where` choice question: 26.8% of decide criteria text for a 1.8% pick rate.",
+   "Ask the measurement-only `motive` question on a deterministic 1-in-4 sample of decides.",
+   "Jitter wake-up and reflection decisions by 0-3 ticks with the seeded RNG, and add a live concurrency semaphore like lab's withSlot. Bursts of 9+ calls ran at 3.1x the solo p50 latency.",
+   "In makeCheckpoint keep options only for the last decision, drop the static map and personas (rebuilt in hydrateWorld), and store metrics as rounded columns: 183 KB to about 41 KB gz per 8-second save.",
+   "ReplayCursor keyframes: clone the world without agent.decisions (125 MB heap to about 8 MB for a 30-day replay).",
+   "Stop echoing `state` in /api/jev answers (4.5 KB to about 1 KB each). The client can compute buildJevCall(toWire(world, req)).state itself, as ReplayCursor already does.",
+   "Canvas: skip the frame when paused and the camera has not moved, and paint buildings into the static layer (62% of the 8,465 fillRects per frame).",
+   "Raise the jev-sandbox gateway key's $10 monthly budget, or surface a clear 'budget exhausted' state. Uncapped, it runs out after about 6 hours at 1x and freezes every villager."
+  ]
+ }
+]

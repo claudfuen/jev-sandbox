@@ -1,13 +1,19 @@
 import { replyCriteria } from "@/lib/jev/prompt"
+import { clockOf } from "@/lib/sim/clock"
 import type { JevAnswer } from "@/lib/jev/schema"
 import type { SimRequest } from "@/lib/sim/engine"
 
 // A deterministic stand-in for JEV so the replay test needs no network.
-export function fakeAnswer(req: SimRequest): JevAnswer {
+export function fakeAnswer(req: SimRequest, opts: { violent?: boolean } = {}): JevAnswer {
   const h = (n: number) => ((req.id * 2654435761 + n * 97) >>> 0) / 4294967296
   const mood = { type: "score" as const, score: Math.floor(h(1) * 5), probabilities: { "0": 0.1, "1": 0.2, "2": 0.4, "3": 0.2, "4": 0.1 } }
   if (req.kind === "decide") {
-    const weights = req.options.map((_, i) => h(i + 2) + 0.05)
+    // Uniform random picks would make violence as common as lunch; damp it so towns survive long enough to test.
+    // ...and let tired people go to bed at night, as real villagers do.
+    const night = ((clockOf(req.tick).hour + 3) % 24) < 9
+    const weights = req.options.map(
+      (o, i) => (h(i + 2) + 0.05) * (/^(kill|attack|shove)_/.test(o.id) && !opts.violent ? 0.15 : 1) * (night && o.id === "sleep" ? 6 : 1),
+    )
     const total = weights.reduce((a, b) => a + b, 0)
     const probabilities = Object.fromEntries(req.options.map((o, i) => [o.id, weights[i] / total]))
     const choice = req.options[weights.indexOf(Math.max(...weights))].id

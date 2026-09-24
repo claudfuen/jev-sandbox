@@ -18,13 +18,16 @@ export type RunEvent =
       type: "answer"
       tick: number
       requestId: number
+      /** Who was asked, and what kind of question: lets a replay detect answers landing on the wrong request. */
+      agentId?: string
+      kind?: SimRequest["kind"]
       mode: ChoiceMode
       answers: Record<string, RawAnswer>
       confidence: Record<string, number>
       latencyMs: number
       costUsd: number | null
     }
-  | { type: "failure"; tick: number; requestId: number; message: string }
+  | { type: "failure"; tick: number; requestId: number; agentId?: string; kind?: SimRequest["kind"]; message: string }
   | { type: "intervention"; tick: number; intervention: Intervention }
 
 export type RunMeta = {
@@ -118,6 +121,8 @@ export class Session {
       type: "answer",
       tick: this.world.tick,
       requestId,
+      agentId: req.agentId,
+      kind: req.kind,
       mode,
       answers: ans.answers,
       confidence: ans.confidence,
@@ -131,7 +136,7 @@ export class Session {
     if (!req) return
     this.pending.delete(requestId)
     failRequest(this.world, req, message)
-    this.events.push({ type: "failure", tick: this.world.tick, requestId, message })
+    this.events.push({ type: "failure", tick: this.world.tick, requestId, agentId: req.agentId, kind: req.kind, message })
   }
 
   intervene(intervention: Intervention) {
@@ -206,7 +211,8 @@ export class ReplayCursor {
         continue
       }
       const req = this.pending.get(ev.requestId)
-      if (!req) {
+      // Recorded on different engine code, the same id can name someone else's question. Never apply it.
+      if (!req || (ev.agentId !== undefined && ev.agentId !== req.agentId) || (ev.kind !== undefined && ev.kind !== req.kind)) {
         this.desyncs += 1
         continue
       }

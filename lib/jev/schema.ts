@@ -90,7 +90,7 @@ export const respondPayloadSchema = z.object({
   askerName: z.string().min(1).max(40),
   offer: offerWireSchema,
   /** What the approached villager has on them, which bounds their honest replies. */
-  can: z.object({ food: z.number().int().min(0).max(20), coins: z.number().int().min(0).max(500) }),
+  can: z.object({ food: z.number().int().min(0).max(1000), coins: z.number().int().min(0).max(1_000_000) }),
 })
 
 /** How a night's reflection can say someone changed. Each maps to small, documented psyche deltas. */

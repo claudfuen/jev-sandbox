@@ -168,6 +168,7 @@ export function createWorld(config: Partial<WorldConfig> = {}): World {
       missingCoins: 0,
       psycheAtBirth: structuredClone(persona.psyche),
       lastReflectDay: 0,
+      lastReflectTick: -REFLECT_GAP_TICKS,
       today: { day: 1, helpers: [], wrongers: [] },
       formative: [],
       goal: null,
@@ -2373,6 +2374,16 @@ function regrowBerries(world: World) {
   }
 }
 
+const STORE_SHELF = 30
+/** At least this long between two nightly reflections: 16 hours. */
+const REFLECT_GAP_TICKS = 192
+
+/** What a shop's next delivery costs at most, which its keeper leaves in the till. */
+function deliveryCost(shop: Shop): number {
+  const d = shop.good === "meal" ? DINER_DELIVERY : shop.good === "drink" ? INN_DELIVERY : STORE_DELIVERY
+  return d.units * d.cost
+}
+
 /** The town's clock: the county grant and deliveries at 7 am; sales tax and payroll at 6 pm. */
 function townDay(world: World) {
   const m = minuteNow(world)
@@ -2382,13 +2393,16 @@ function townDay(world: World) {
     town.treasury += COUNTY_GRANT
     count(world, "coins_in", COUNTY_GRANT)
     const deliver = (shop: Shop, units: number, cost: number) => {
+      // Meals are cooked fresh each day: yesterday's are gone whether or not the cart can be paid.
+      if (shop.good === "meal") shop.stock = 0
       const n = Math.min(units, Math.floor(shop.till / cost))
       if (n <= 0) return
       shop.till -= n * cost
       shop.stock = shop.good === "meal" ? n : shop.stock + n
       count(world, "coins_out", n * cost)
     }
-    if (STORE_DELIVERY.days.includes(weekday(day))) deliver(shops.store, STORE_DELIVERY.units, STORE_DELIVERY.cost)
+    // The store orders only what tops its shelf back up.
+    if (STORE_DELIVERY.days.includes(weekday(day))) deliver(shops.store, Math.max(0, STORE_SHELF - shops.store.stock), STORE_DELIVERY.cost)
     deliver(shops.diner, DINER_DELIVERY.units, DINER_DELIVERY.cost)
     deliver(shops.inn, INN_DELIVERY.units, INN_DELIVERY.cost)
     log(world, `${WEEKDAY_NAMES[weekday(day) - 1]} morning: the county grant arrives and the delivery cart comes through.`, [], "info")
@@ -2400,6 +2414,16 @@ function townDay(world: World) {
       town.treasury += tax
       count(world, "sales_tax", tax)
       shop.salesToday = 0
+      // The business belongs to its keeper: profit above what tomorrow's cart costs goes home with them.
+      const keeper = agentById(world, shop.keeperId)
+      const float = deliveryCost(shop)
+      const profit = Math.max(0, shop.till - float)
+      if (keeper && isAlive(keeper) && profit > 0) {
+        shop.till -= profit
+        keeper.coins += profit
+        count(world, "profit_taken", profit)
+        remember(world, keeper, `You took ${profit} coins of profit home from the till, keeping ${float} for tomorrow's delivery.`)
+      }
     }
     for (const agent of world.agents) {
       const job = jobOf(agent)
@@ -2483,7 +2507,6 @@ export function step(world: World): SimRequest[] {
   for (const agent of world.agents) {
     agent.prev = { ...agent.pos }
     if (agent.flash && agent.flash.until <= world.tick) agent.flash = null
-    if (agent.today.day !== today) agent.today = { day: today, helpers: [], wrongers: [] }
   }
 
   for (const agent of world.agents) {
@@ -2581,9 +2604,13 @@ export function step(world: World): SimRequest[] {
         break
       }
       case "sleeping": {
-        if (agent.lastReflectDay !== today) {
+        // Once per night's sleep, not per calendar day: going to bed after midnight still closes the day just lived.
+        const h = clockOf(world.tick).hour
+        if ((h >= 19 || h < 5) && world.tick - agent.lastReflectTick >= REFLECT_GAP_TICKS) {
+          agent.lastReflectTick = world.tick
           agent.lastReflectDay = today
           requests.push(reflectRequest(world, agent))
+          agent.today = { day: today, helpers: [], wrongers: [] }
         }
         const { hour } = clockOf(world.tick)
         const daytime = hour >= 5 && hour < 22

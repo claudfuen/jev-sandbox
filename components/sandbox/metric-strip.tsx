@@ -58,6 +58,16 @@ function series(samples: MetricSample[], spec: StripSpec): { tick: number; v: nu
   })
 }
 
+/** At most one point per horizontal unit of the strip; always keeps the latest. */
+function thin<T>(points: T[], max = W): T[] {
+  if (points.length <= max) return points
+  const step = points.length / max
+  const out: T[] = []
+  for (let i = 0; i < max - 1; i++) out.push(points[Math.floor(i * step)])
+  out.push(points[points.length - 1])
+  return out
+}
+
 /** One metric over the run: single series, hover crosshair, optional playhead, click to seek. */
 export function MetricStrip({
   spec,
@@ -75,12 +85,15 @@ export function MetricStrip({
   onSeek?: (tick: number) => void
 }) {
   const [hover, setHover] = useState<{ tick: number; v: number } | null>(null)
-  const points = series(samples, spec)
+  const points = thin(series(samples, spec))
+  // A long-lived world keeps only recent samples, so the axis starts at the oldest one kept.
+  const domainStart = Math.min(samples[0]?.tick ?? 0, domainEnd - 1)
+  const span = Math.max(1, domainEnd - domainStart)
   const format = spec.format ?? whole
   const values = points.map((p) => p.v)
   const min = Math.min(...values, 0)
   const max = Math.max(...values, min + 1e-9)
-  const x = (t: number) => PAD + (t / Math.max(1, domainEnd)) * (W - PAD * 2)
+  const x = (t: number) => PAD + ((t - domainStart) / span) * (W - PAD * 2)
   const y = (v: number) => H - PAD - ((v - min) / (max - min)) * (H - PAD * 2)
   const path = points.map((p, i) => `${i ? "L" : "M"}${x(p.tick).toFixed(1)},${y(p.v).toFixed(1)}`).join("")
   const reference = playhead ?? Infinity
@@ -89,7 +102,7 @@ export function MetricStrip({
 
   function tickAt(event: React.MouseEvent<SVGSVGElement>) {
     const rect = event.currentTarget.getBoundingClientRect()
-    return Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * domainEnd
+    return domainStart + Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * span
   }
 
   function nearest(t: number) {

@@ -230,7 +230,7 @@ describe("justice", () => {
         for (const req of session.tick()) {
           const agent = session.world.agents.find((a) => a.id === req.agentId)!
           expect(agent.status.kind).not.toBe("dead")
-          session.answer(req.id, fakeAnswer(req), "sample")
+          session.answer(req.id, fakeAnswer(req, { violent: true }), "sample")
         }
         for (const a of session.world.agents) {
           if (a.status.kind === "jailed") {
@@ -250,7 +250,7 @@ describe("justice", () => {
         expect(a.decisions.every((d) => d.tick <= died)).toBe(true)
       }
     }
-    // Random stand-in answers are violent; this proves the path is exercised.
+    // Undamped random answers are violent; this proves the path is exercised.
     expect(deaths).toBeGreaterThan(0)
   })
 })

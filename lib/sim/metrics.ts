@@ -24,7 +24,8 @@ const alive = (w: World) => w.agents.filter((a) => a.status.kind !== "dead")
 const mean = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0)
 
 function affinities(world: World): number[] {
-  return alive(world).flatMap((a) => alive(world).filter((b) => b.id !== a.id).map((b) => a.affinity[b.id] ?? 0))
+  const living = alive(world)
+  return living.flatMap((a) => living.filter((b) => b.id !== a.id).map((b) => a.affinity[b.id] ?? 0))
 }
 
 function gini(xs: number[]): number {

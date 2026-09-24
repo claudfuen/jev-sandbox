@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import type { JevAnswer } from "@/lib/jev/schema"
 import { hydrateWorld, isCheckpoint, LIVE_WORLD, makeCheckpoint, type Checkpoint, type LiveSettings } from "@/lib/sim/checkpoint"
 import { toWire, type SimRequest } from "@/lib/sim/engine"
-import { sampleMetrics } from "@/lib/sim/metrics"
+import { sampleMetrics, type MetricSample } from "@/lib/sim/metrics"
 import { Session, type RunRecord } from "@/lib/sim/session"
 import type { ChoiceMode, Intervention, World } from "@/lib/sim/types"
 
@@ -388,8 +388,12 @@ export function useSandbox() {
   }, [])
 
   const world = sessionRef.current.world
-  // Hourly samples plus a live point for right now, so the charts move every tick.
-  const metrics = [...sessionRef.current.metrics, sampleMetrics(world)]
+  // Hourly samples plus a live point for right now, so the charts move every tick. Computed once per tick.
+  const live = useRef<{ session: Session | null; tick: number; metrics: MetricSample[] }>({ session: null, tick: -1, metrics: [] })
+  if (live.current.session !== sessionRef.current || live.current.tick !== world.tick || live.current.metrics.length !== sessionRef.current.metrics.length + 1) {
+    live.current = { session: sessionRef.current, tick: world.tick, metrics: [...sessionRef.current.metrics, sampleMetrics(world)] }
+  }
+  const metrics = live.current.metrics
 
   return {
     worldRef,

@@ -338,6 +338,8 @@ export type Agent = {
   /** The psyche they were born with; reflection drift is capped relative to it. */
   psycheAtBirth: Psyche
   lastReflectDay: number
+  /** Tick of the last nightly reflection, so each sleep reflects at most once. */
+  lastReflectTick: number
   /** Who helped and who wronged them today, for tonight's reflection. */
   today: { day: number; helpers: string[]; wrongers: string[] }
   /** Moments JEV said they will carry for years. */

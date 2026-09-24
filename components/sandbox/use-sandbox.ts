@@ -16,7 +16,7 @@ import type { ChoiceMode, Intervention, World } from "@/lib/sim/types"
 
 /** Real milliseconds per tick at 1x. One tick is five in-game minutes. */
 const BASE_TICK_MS = 260
-const SAVE_EVERY_MS = 8_000
+const SAVE_EVERY_MS = 4_000
 /** Even a paused world rewrites its lease this often, so it is not taken over. */
 const HEARTBEAT_MS = 20_000
 const WATCH_EVERY_MS = 4_000
